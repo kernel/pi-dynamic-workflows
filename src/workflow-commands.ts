@@ -30,7 +30,7 @@ const STATUS_ICON: Record<string, string> = {
 };
 
 const USAGE =
-  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | rm <id> | save <name> [runId]";
+  "Usage: /workflows [list] | run <prompt> | status <id> | watch <id> | stop <id> | pause <id> | resume <id> | restart <id> | rm <id> | save <name> [runId]";
 
 const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow from the prompt";
 
@@ -147,7 +147,7 @@ export function registerWorkflowCommands(
 
   pi.registerCommand("workflows", {
     description:
-      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume <id> | rm <id> | save <name> [runId]",
+      "Manage workflow runs — no args (opens navigator) | run <prompt> | status/stop/pause/resume/restart <id> | rm <id> | save <name> [runId]",
     async handler(args: string, ctx: ExtensionCommandContext) {
       const manager = getManager();
       const parts = args.trim().split(/\s+/).filter(Boolean);
@@ -266,6 +266,21 @@ export function registerWorkflowCommands(
           if (!id) return ctx.ui.notify(USAGE, "warning");
           const ok = await manager.resume(id);
           ctx.ui.notify(ok ? `Resumed ${id}` : `Resume not available for ${id} yet`, ok ? "info" : "warning");
+          return;
+        }
+        case "restart": {
+          if (!id) return ctx.ui.notify(USAGE, "warning");
+          const run = manager.listRuns().find((candidate) => candidate.runId === id);
+          if (!run?.script) return ctx.ui.notify(`Cannot restart ${id} (no script saved)`, "warning");
+          try {
+            const { runId: newId } = manager.startInBackground(run.script, run.args);
+            ctx.ui.notify(`Restarted ${run.workflowName || "workflow"} as ${newId}`, "info");
+          } catch (error) {
+            ctx.ui.notify(
+              `Failed to restart ${run.workflowName || "workflow"}: ${error instanceof Error ? error.message : error}`,
+              "error",
+            );
+          }
           return;
         }
         case "rm": {

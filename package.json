@@ -12,6 +12,18 @@
     ".": {
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js"
+    },
+    "./headless": {
+      "types": "./dist/headless.d.ts",
+      "import": "./dist/headless.js"
+    },
+    "./headless-control": {
+      "types": "./dist/headless-control.d.ts",
+      "import": "./dist/headless-control.js"
+    },
+    "./workflow-paths": {
+      "types": "./dist/workflow-paths.d.ts",
+      "import": "./dist/workflow-paths.js"
     }
   },
   "files": [

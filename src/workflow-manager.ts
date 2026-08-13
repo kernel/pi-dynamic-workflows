@@ -412,7 +412,12 @@ export class WorkflowManager extends EventEmitter {
           const lease = this.persistence.acquireRunLease(p.runId);
           if (!lease) continue;
           try {
-            this.persistence.save({ ...p, status: "paused" });
+            this.persistence.save({
+              ...p,
+              status: "paused",
+              pauseReason: "cold_recovery",
+              resetHint: undefined,
+            });
           } finally {
             this.persistence.releaseRunLease(lease);
           }
