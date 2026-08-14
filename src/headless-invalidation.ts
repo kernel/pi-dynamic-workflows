@@ -54,22 +54,10 @@ export function installHeadlessWorkflowInvalidations(
       availableActions: options.availableActions?.(runId),
     };
     try {
-      void Promise.resolve(
-        pi.sendMessage(
-          {
-            customType: HYPESHIP_WORKFLOW_INVALIDATION_TYPE,
-            content: JSON.stringify(invalidation),
-            display: false,
-          },
-          { triggerTurn: false },
-        ),
-      ).catch(() => {
-        // The durable VM publisher retries full records. A custom-message failure
-        // is therefore a missed hint, healed by terminal gating and safety polls.
-      });
+      pi.appendEntry(HYPESHIP_WORKFLOW_INVALIDATION_TYPE, invalidation);
     } catch {
-      // The durable VM publisher retries full records. A custom-message failure
-      // is therefore a missed hint, healed by terminal gating and safety polls.
+      // The durable VM publisher retries full records. An append failure is a
+      // missed hint, healed by terminal gating and safety polls.
     }
   };
 

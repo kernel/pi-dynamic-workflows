@@ -80,7 +80,7 @@ test("headless control ignores malformed request envelopes", async () => {
     registerCommand(_name: string, command: { handler(args: string): Promise<void> }) {
       handler = command.handler;
     },
-    sendMessage() {
+    appendEntry() {
       sent += 1;
     },
   };
@@ -107,8 +107,8 @@ test("headless control suppresses a duplicate while its original attempt is in f
     registerCommand(_name: string, command: { handler(args: string): Promise<void> }) {
       handler = command.handler;
     },
-    sendMessage(message: unknown) {
-      sent.push(message);
+    appendEntry(customType: string, data: unknown) {
+      sent.push({ customType, data });
     },
   };
   let resumed = 0;
@@ -154,8 +154,8 @@ test("headless invalidations coalesce and terminal transitions flush", async () 
   const manager = new EventEmitter();
   const sent: HeadlessWorkflowInvalidation[] = [];
   const pi = {
-    sendMessage(message: { content: string }) {
-      sent.push(JSON.parse(message.content) as HeadlessWorkflowInvalidation);
+    appendEntry(_customType: string, data: HeadlessWorkflowInvalidation) {
+      sent.push(data);
     },
   };
   const bridge = installHeadlessWorkflowInvalidations(pi as never, manager as never);
@@ -178,16 +178,15 @@ test("headless invalidations coalesce and terminal transitions flush", async () 
   bridge.dispose();
 });
 
-test("headless invalidation bridge swallows async send failures", async () => {
+test("headless invalidation bridge swallows append failures", () => {
   const manager = new EventEmitter();
   const pi = {
-    sendMessage() {
-      return Promise.reject(new Error("failed"));
+    appendEntry() {
+      throw new Error("failed");
     },
   };
   const bridge = installHeadlessWorkflowInvalidations(pi as never, manager as never);
 
-  manager.emit("complete", { runId: "wf_1" });
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.doesNotThrow(() => manager.emit("complete", { runId: "wf_1" }));
   bridge.dispose();
 });
