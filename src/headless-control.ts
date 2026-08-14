@@ -96,14 +96,7 @@ export function installHeadlessWorkflowControls(
           inFlight.delete(request.requestId);
         }
       }
-      await pi.sendMessage(
-        {
-          customType: HYPESHIP_WORKFLOW_CONTROL_RESULT_TYPE,
-          content: JSON.stringify(response),
-          display: false,
-        },
-        { triggerTurn: false },
-      );
+      pi.appendEntry(HYPESHIP_WORKFLOW_CONTROL_RESULT_TYPE, response);
     },
   });
 }
