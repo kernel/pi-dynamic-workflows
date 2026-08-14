@@ -1545,6 +1545,26 @@ test(
 // ─── persistRun: honest per-agent timestamps + throttled progress persists ────
 
 test(
+  "running agent progress is persisted before the agent finishes",
+  withTempCwd(async (cwd) => {
+    const deferred = deferredAgent();
+    const manager = new WorkflowManager({ cwd, agent: deferred.runner });
+    const { runId, promise } = manager.startInBackground(oneAgentScript);
+
+    await new Promise((resolve) => setTimeout(resolve, 450));
+
+    const persisted = manager.listRuns().find((run) => run.runId === runId);
+    assert.equal(persisted?.status, "running");
+    assert.equal(persisted?.agents.length, 1);
+    assert.equal(persisted?.agents[0]?.status, "running");
+    assert.equal(persisted?.agents[0]?.label, "a");
+
+    deferred.resolve();
+    await promise;
+  }),
+);
+
+test(
   "persisted per-agent timestamps are real, not fabricated from the run's startedAt/now",
   withTempCwd(async (cwd) => {
     const manager = new WorkflowManager({ cwd, agent: firstThenHangAgent() });
