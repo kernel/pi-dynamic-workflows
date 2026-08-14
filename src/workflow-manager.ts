@@ -1010,8 +1010,8 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
-  /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
-  private static readonly PERSIST_THROTTLE_MS = 400;
+  /** Keep disk state current before the 250 ms headless invalidation flush reads it. */
+  private static readonly PERSIST_THROTTLE_MS = 200;
 
   /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
