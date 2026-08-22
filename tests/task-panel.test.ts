@@ -548,6 +548,49 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("test-workflow"));
   });
 
+  it("keeps the generation-change retry locked until its send settles", async () => {
+    let rejectStale: ((err: Error) => void) | undefined;
+    let resolveRetry: (() => void) | undefined;
+    let retryCalls = 0;
+    const stalePi = createMockPi();
+    const retryPi = createMockPi();
+    const reboundPi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    setup(stalePi, manager, SESSION, {
+      stableSend: () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectStale = reject;
+        }),
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    mod.bindSessionDelivery(SESSION, retryPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: () => {
+        retryCalls += 1;
+        return new Promise<void>((resolve) => {
+          resolveRetry = resolve;
+        });
+      },
+    });
+    rejectStale?.(new Error("late network blip"));
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(retryCalls, 1, "the new generation starts one retry");
+
+    mod.bindSessionDelivery(SESSION, reboundPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(reboundPi),
+    });
+    assert.equal(piCalls(reboundPi).length, 0, "a rebind must not duplicate the in-flight retry");
+
+    resolveRetry?.();
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+
   it("never silently drops pending deliveries when the queue grows past the soft cap", () => {
     const pi1 = createMockPi();
     const pi2 = createMockPi();

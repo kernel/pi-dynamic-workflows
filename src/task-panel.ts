@@ -486,22 +486,22 @@ function deliverAndAck(
 
   inFlightDeliveries.add(runId);
   const startedGeneration = endpoint.generation;
+  let releasedBeforeFinally = false;
   void tryDeliverEndpoint(endpoint, content)
     .then((ok) => {
       if (ok) {
         clearRunPending(manager, runId, run ?? manager.getRun?.(runId));
         return;
       }
-      // Release the in-flight lock before a generation-change retry so flush
-      // can actually pick this run back up.
       inFlightDeliveries.delete(runId);
+      releasedBeforeFinally = true;
       const current = sessionEndpoints.get(sessionId);
       if (current && !current.suspended && current.generation !== startedGeneration && current.manager) {
         flushSessionDiskPending(current.manager, sessionId, current);
       }
     })
     .finally(() => {
-      inFlightDeliveries.delete(runId);
+      if (!releasedBeforeFinally) inFlightDeliveries.delete(runId);
     });
 }
 
