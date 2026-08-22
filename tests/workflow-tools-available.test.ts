@@ -25,6 +25,7 @@ import {
   handoffWorkflowRuntime,
   takeWorkflowRuntime,
 } from "../src/extension-reload.js";
+import { _registerBoundSessionSendForTests, _resetDeliveryRegistriesForTests } from "../src/task-panel.js";
 import { buildArmedWorkflowPrompt, WORKFLOW_TOOL_NAME, type WorkflowModeState } from "../src/workflow-editor.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
 
@@ -525,13 +526,21 @@ describe("workflow extension - control tool availability", () => {
           installExtension(secondPi);
           assert.equal(takeWorkflowRuntime(process.cwd()), undefined, "second generation claims the staged runtime");
 
+          // Production session_start does not pass stableSend — steal map only.
+          _resetDeliveryRegistriesForTests();
+          _registerBoundSessionSendForTests(`session-${reason}`, (msg) => {
+            if (typeof msg.content === "string") secondDelivered.push(msg.content);
+            return Promise.resolve();
+          });
           secondHandlers.session_start?.[0]?.(
             { reason },
             {
               cwd: process.cwd(),
               model: undefined,
               modelRegistry: {},
-              sessionManager: { getSessionId: () => `session-${reason}` },
+              sessionManager: {
+                getSessionId: () => `session-${reason}`,
+              },
               ui: { setWidget: () => {}, notify: () => {} },
             },
           );
@@ -539,6 +548,7 @@ describe("workflow extension - control tool availability", () => {
           const fakeRun = {
             runId: "bg-1",
             background: true,
+            sessionId: `session-${reason}`,
             snapshot: { name: "t", agentCount: 0 },
             result: { agentCount: 0, result: { verdict: `ok-${reason}` } },
           };
@@ -548,7 +558,7 @@ describe("workflow extension - control tool availability", () => {
           staged.manager.emit("complete", { runId: "bg-1" });
           assert.ok(
             secondDelivered.some((c) => c.includes(`ok-${reason}`)),
-            `completion after ${reason} handoff must deliver via the new generation's pi`,
+            `completion after ${reason} handoff must deliver via the stolen host send`,
           );
           discardWorkflowRuntime(process.cwd());
         }
@@ -808,6 +818,73 @@ describe("workflow extension - control tool availability", () => {
     }
   });
 
+  it("wires model_select to manager.setMainModel", async () => {
+    const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-model-select-"));
+    try {
+      await withFakeHomeAsync(fakeHome, async () => {
+        discardWorkflowRuntime(process.cwd());
+        const { WorkflowManager } = await import("../src/workflow-manager.js");
+        const seen: Array<string | undefined> = [];
+        const original = WorkflowManager.prototype.setMainModel;
+        WorkflowManager.prototype.setMainModel = function setMainModelSpy(spec: string | undefined) {
+          seen.push(spec);
+          return original.call(this, spec);
+        };
+        try {
+          const activeTools = ["bash", "read"];
+          const handlers: Record<string, Array<(...args: any[]) => any>> = {};
+          const pi = {
+            registerTool: () => {},
+            registerCommand: () => {},
+            getCommands: () => [],
+            on: (event: string, handler: (...args: any[]) => any) => {
+              if (!handlers[event]) handlers[event] = [];
+              handlers[event].push(handler);
+            },
+            getActiveTools: () => [...activeTools],
+            setActiveTools: (tools: string[]) => {
+              activeTools.splice(0, activeTools.length, ...tools);
+            },
+            sendMessage: () => {},
+          } as unknown as ExtensionAPI;
+          const { default: installExtension } = await import("../extensions/workflow.js");
+          installExtension(pi);
+
+          assert.equal(handlers.model_select?.length, 1, "must listen for model_select");
+
+          handlers.session_start[0](
+            {},
+            {
+              cwd: process.cwd(),
+              model: { provider: "start-prov", id: "model-a" },
+              modelRegistry: {},
+              sessionManager: { getSessionId: () => "session-model" },
+              ui: { setWidget: () => {}, notify: () => {} },
+            },
+          );
+          assert.ok(seen.includes("start-prov/model-a"), "session_start should seed mainModel from ctx.model");
+
+          handlers.model_select[0]({
+            type: "model_select",
+            model: { provider: "live-prov", id: "model-b" },
+            previousModel: { provider: "start-prov", id: "model-a" },
+            source: "set",
+          });
+          assert.ok(
+            seen.includes("live-prov/model-b"),
+            "model_select must call setMainModel with the newly selected spec",
+          );
+
+          discardWorkflowRuntime(process.cwd());
+        } finally {
+          WorkflowManager.prototype.setMainModel = original;
+        }
+      });
+    } finally {
+      rmSync(fakeHome, { recursive: true, force: true });
+    }
+  });
+
   it("queues completions that land before session_start and flushes them after", async () => {
     const fakeHome = mkdtempSync(join(tmpdir(), "pi-dw-control-extension-prebind-"));
     try {
@@ -877,17 +954,30 @@ describe("workflow extension - control tool availability", () => {
         const origGet = mgr.getRun.bind(mgr);
         (mgr as { getRun: (id: string) => unknown }).getRun = (id: string) =>
           id === "bg-prebind" ? fakeRun : origGet(id);
+        // Ensure flush can see the in-memory pending marker (not only disk).
+        const origListLive = mgr.listLiveRuns?.bind(mgr);
+        (mgr as { listLiveRuns: () => unknown[] }).listLiveRuns = () => {
+          const live = origListLive ? origListLive() : [];
+          return live.some((r: { runId?: string }) => r?.runId === "bg-prebind") ? live : [...live, fakeRun];
+        };
         mgr.emit("complete", { runId: "bg-prebind" });
         assert.equal(delivered.length, 0, "must not deliver while runtime unbound");
 
         pi2._bound = true;
+        _resetDeliveryRegistriesForTests();
+        _registerBoundSessionSendForTests("s-prebind", (msg) => {
+          if (typeof msg.content === "string") delivered.push(msg.content);
+          return Promise.resolve();
+        });
         handlers2.session_start?.[0]?.(
           { reason: "reload" },
           {
             cwd: process.cwd(),
             model: undefined,
             modelRegistry: {},
-            sessionManager: { getSessionId: () => "s-prebind" },
+            sessionManager: {
+              getSessionId: () => "s-prebind",
+            },
             ui: { setWidget: () => {}, notify: () => {} },
           },
         );

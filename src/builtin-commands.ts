@@ -10,8 +10,7 @@
  * whole session until the workflow finished (#104).
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
+import { spawn } from "node:child_process";
 import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
@@ -20,16 +19,244 @@ import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
 
-const execFileAsync = promisify(execFile);
+const COMMAND_ERROR_MAX_CHARS = 32_000;
+const AUTO_SCOPE_METADATA_MAX_CHARS = 2_000_000;
+const AUTO_SCOPE_MAX_PATHS = 4_096;
+const AUTO_SCOPE_MAX_ARG_BYTES = 256 * 1024;
+
+const AUTO_SCOPE_ROOT_RULES: ReadonlyArray<readonly [prefix: string, reason: string]> = [
+  [".playwright-mcp", "browser capture"],
+  ["graphify-out", "graph index output"],
+  ["supabase/.temp", "tool state"],
+  [".code-review-graph", "code index output"],
+  [".gitnexus", "code index output"],
+  [".codegraph", "code index output"],
+];
+
+const AUTO_SCOPE_DIRECTORY_RULES = new Map<string, string>([
+  ["node_modules", "dependency output"],
+  ["coverage", "coverage output"],
+  [".nyc_output", "coverage output"],
+  ["__pycache__", "cache output"],
+  [".pytest_cache", "cache output"],
+  [".mypy_cache", "cache output"],
+  [".ruff_cache", "cache output"],
+  [".turbo", "cache output"],
+  [".cache", "cache output"],
+  ["playwright-report", "browser report"],
+  ["test-results", "test output"],
+]);
+
+export interface CapturedCommandPrefix {
+  stdout: string;
+  totalChars: number;
+}
+
+export interface DiffNumstatEntry {
+  path: string;
+  addedLines: number | null;
+  deletedLines: number | null;
+  binary: boolean;
+}
+
+export interface ExcludedDiffEntry extends DiffNumstatEntry {
+  reason: string;
+}
+
+export interface CodeReviewAutoScope {
+  included: DiffNumstatEntry[];
+  excluded: ExcludedDiffEntry[];
+}
 
 /**
- * Cap on the diff-source exec's stdout+stderr buffer. Node's default (1 MB)
- * throws on anything but a small diff — `gh pr diff` on a sizeable PR routinely
- * exceeds it. 64 MB comfortably covers any realistic diff while still bounding
- * worst-case memory; the prompt-side cap (code-review.ts's MAX_DIFF_CHARS) is
- * what actually protects the review from a huge diff, not this buffer.
+ * Stream command output while retaining only the prefix the review can use.
+ * This keeps memory bounded by MAX_DIFF_CHARS without imposing a child-process
+ * maxBuffer that rejects large diffs before the review's own truncation policy
+ * can run. stdout is decoded incrementally so split UTF-8 sequences are counted
+ * the same way as JavaScript String.length.
  */
-const DIFF_EXEC_MAX_BUFFER = 64 * 1024 * 1024;
+export function captureCommandPrefix(
+  command: string,
+  args: string[],
+  options: { cwd: string; maxChars: number },
+): Promise<CapturedCommandPrefix> {
+  if (!Number.isSafeInteger(options.maxChars) || options.maxChars < 1) {
+    return Promise.reject(new Error("captureCommandPrefix: maxChars must be a positive safe integer"));
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, {
+      cwd: options.cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+
+    let stdout = "";
+    let totalChars = 0;
+    let stderr = "";
+    let stderrTruncated = false;
+
+    child.stdout.on("data", (chunk: string) => {
+      totalChars += chunk.length;
+      const remaining = options.maxChars - stdout.length;
+      if (remaining > 0) stdout += chunk.slice(0, remaining);
+    });
+    child.stderr.on("data", (chunk: string) => {
+      const remaining = COMMAND_ERROR_MAX_CHARS - stderr.length;
+      if (remaining > 0) stderr += chunk.slice(0, remaining);
+      if (chunk.length > remaining) stderrTruncated = true;
+    });
+
+    child.once("error", reject);
+    child.stdout.once("error", reject);
+    child.stderr.once("error", reject);
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        resolve({ stdout, totalChars });
+        return;
+      }
+      const reason = signal ? `signal ${signal}` : `exit code ${code ?? "unknown"}`;
+      const detail = stderr.trim();
+      const truncationNote = stderrTruncated ? " [stderr truncated]" : "";
+      reject(new Error(`${command} failed with ${reason}${detail ? `: ${detail}${truncationNote}` : ""}`));
+    });
+  });
+}
+
+/** Parse `git diff --numstat -z --no-renames` without losing unusual filenames. */
+export function parseDiffNumstat(output: string): DiffNumstatEntry[] {
+  if (output.length === 0) return [];
+  if (!output.endsWith("\0")) throw new Error("git numstat output is not NUL-terminated");
+
+  return output
+    .slice(0, -1)
+    .split("\0")
+    .map((record, index) => {
+      const firstTab = record.indexOf("\t");
+      const secondTab = firstTab < 0 ? -1 : record.indexOf("\t", firstTab + 1);
+      if (firstTab < 1 || secondTab < firstTab + 2) {
+        throw new Error(`git numstat record ${index + 1} is malformed`);
+      }
+
+      const addedText = record.slice(0, firstTab);
+      const deletedText = record.slice(firstTab + 1, secondTab);
+      const path = record.slice(secondTab + 1);
+      if (!path || path.includes("\uFFFD")) {
+        throw new Error(`git numstat record ${index + 1} has an unsupported path`);
+      }
+
+      const binary = addedText === "-" && deletedText === "-";
+      if (!binary && (!/^\d+$/.test(addedText) || !/^\d+$/.test(deletedText))) {
+        throw new Error(`git numstat record ${index + 1} has invalid line counts`);
+      }
+      if (!binary && (addedText === "-" || deletedText === "-")) {
+        throw new Error(`git numstat record ${index + 1} has inconsistent binary markers`);
+      }
+
+      const addedLines = binary ? null : Number.parseInt(addedText, 10);
+      const deletedLines = binary ? null : Number.parseInt(deletedText, 10);
+      if (
+        (addedLines !== null && !Number.isSafeInteger(addedLines)) ||
+        (deletedLines !== null && !Number.isSafeInteger(deletedLines))
+      ) {
+        throw new Error(`git numstat record ${index + 1} exceeds safe integer limits`);
+      }
+
+      return { path, addedLines, deletedLines, binary };
+    });
+}
+
+/** Return a reason only for paths that are high-confidence generated artifacts. */
+export function classifyCodeReviewArtifact(path: string): string | undefined {
+  for (const [prefix, reason] of AUTO_SCOPE_ROOT_RULES) {
+    if (path.startsWith(`${prefix}/`)) return reason;
+  }
+
+  const segments = path.split("/");
+  for (const segment of segments.slice(0, -1)) {
+    const reason = AUTO_SCOPE_DIRECTORY_RULES.get(segment);
+    if (reason) return reason;
+  }
+  for (let index = 0; index < segments.length - 2; index += 1) {
+    if (segments[index] === "cypress" && ["screenshots", "videos"].includes(segments[index + 1])) {
+      return "browser capture";
+    }
+  }
+
+  const basename = segments.at(-1)?.toLowerCase() ?? "";
+  if (/\.(?:[cm]?js|css)\.map$/.test(basename)) return "source map";
+  if (/\.(?:min|bundle)\.(?:[cm]?js|css)$/.test(basename)) return "compiled bundle";
+  if (basename.endsWith(".tsbuildinfo")) return "compiler state";
+  if (basename.includes(".generated.") || basename.includes(".gen.")) return "generated file";
+  return undefined;
+}
+
+/** Flags shared by every bare `git diff HEAD` path (auto-scoped, unscoped, and fail-open). */
+const BARE_DIFF_HEAD_ARGS = ["diff", "HEAD", "--no-ext-diff", "--no-textconv", "--no-color", "--no-renames"] as const;
+
+export async function discoverCodeReviewAutoScope(cwd: string): Promise<CodeReviewAutoScope> {
+  const metadata = await captureCommandPrefix(
+    "git",
+    ["diff", "HEAD", "--numstat", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color"],
+    { cwd, maxChars: AUTO_SCOPE_METADATA_MAX_CHARS },
+  );
+  if (metadata.totalChars > metadata.stdout.length) {
+    throw new Error(`tracked-change metadata exceeds ${AUTO_SCOPE_METADATA_MAX_CHARS.toLocaleString()} characters`);
+  }
+
+  const included: DiffNumstatEntry[] = [];
+  const excluded: ExcludedDiffEntry[] = [];
+  for (const entry of parseDiffNumstat(metadata.stdout)) {
+    const reason = classifyCodeReviewArtifact(entry.path);
+    if (reason) excluded.push({ ...entry, reason });
+    else included.push(entry);
+  }
+  return { included, excluded };
+}
+
+function buildAutoScopedDiffArgs(scope: CodeReviewAutoScope): string[] {
+  if (scope.included.length > AUTO_SCOPE_MAX_PATHS) {
+    throw new Error(
+      `auto-scope selected ${scope.included.length.toLocaleString()} paths (limit ${AUTO_SCOPE_MAX_PATHS})`,
+    );
+  }
+  const argBytes = scope.included.reduce((total, entry) => total + Buffer.byteLength(entry.path, "utf8") + 1, 0);
+  if (argBytes > AUTO_SCOPE_MAX_ARG_BYTES) {
+    throw new Error(
+      `auto-scope path arguments use ${argBytes.toLocaleString()} bytes (limit ${AUTO_SCOPE_MAX_ARG_BYTES.toLocaleString()})`,
+    );
+  }
+  return ["--literal-pathspecs", ...BARE_DIFF_HEAD_ARGS, "--", ...scope.included.map((entry) => entry.path)];
+}
+
+function sumChangedLines(entries: DiffNumstatEntry[]): number {
+  return entries.reduce((total, entry) => total + (entry.addedLines ?? 0) + (entry.deletedLines ?? 0), 0);
+}
+
+function formatAutoScopeNotice(scope: CodeReviewAutoScope): string {
+  const reasons = new Map<string, number>();
+  for (const entry of scope.excluded) reasons.set(entry.reason, (reasons.get(entry.reason) ?? 0) + 1);
+  const reasonSummary = [...reasons.entries()]
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([reason, count]) => `${reason}: ${count}`)
+    .join(", ");
+  const selectedLines = sumChangedLines(scope.included);
+  const skippedLines = sumChangedLines(scope.excluded);
+  const skippedBinaries = scope.excluded.filter((entry) => entry.binary).length;
+  const binarySummary = skippedBinaries > 0 ? `; ${skippedBinaries.toLocaleString()} binary` : "";
+  return (
+    `Auto-scope: reviewing ${scope.included.length.toLocaleString()} tracked files ` +
+    `(~${selectedLines.toLocaleString()} changed lines); skipped ${scope.excluded.length.toLocaleString()} ` +
+    `high-confidence artifacts (~${skippedLines.toLocaleString()} changed lines${binarySummary}). ` +
+    `Rules: ${reasonSummary}. Use /code-review <path> to include an artifact explicitly.`
+  );
+}
+
+function shortError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  return message.length > 500 ? `${message.slice(0, 500)}…` : message;
+}
 
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
   try {
@@ -197,58 +424,104 @@ export function registerBuiltinWorkflows(
       async handler(args: string, ctx: ExtensionCommandContext) {
         if (runSavedShadowIfPresent("code-review", args, ctx)) return;
         const input = args.trim();
+        const cwd = getCwd();
         let diffSource = "git diff HEAD";
-        let diff = "";
+        let cmd: string;
+        let cmdArgs: string[];
+        let autoScope: CodeReviewAutoScope | undefined;
 
-        try {
-          let cmd: string;
-          let cmdArgs: string[];
-          if (!input) {
-            diffSource = "git diff HEAD";
-            cmd = "git";
-            cmdArgs = ["diff", "HEAD"];
-          } else if (/^\d+$/.test(input)) {
-            diffSource = `gh pr diff ${input}`;
-            cmd = "gh";
-            cmdArgs = ["pr", "diff", input];
-          } else if (input.includes("..")) {
-            diffSource = `git diff ${input}`;
-            cmd = "git";
-            cmdArgs = ["diff", input];
-          } else {
-            diffSource = `git diff HEAD -- ${input}`;
-            cmd = "git";
-            cmdArgs = ["diff", "HEAD", "--", input];
-          }
-          // execFile (not exec/shell) + array args: input can't break out into a
-          // shell command. maxBuffer raised well past Node's 1MB default so a
-          // large `gh pr diff` doesn't throw ERR_CHILD_PROCESS_STDOUT_MAXBUFFER.
-          const { stdout } = await execFileAsync(cmd, cmdArgs, { cwd: getCwd(), maxBuffer: DIFF_EXEC_MAX_BUFFER });
-          diff = stdout;
-          if (!diff.trim()) {
-            return ctx.ui.notify(`No diff output from: ${diffSource}`, "warning");
-          }
-        } catch (err) {
-          const code = (err as NodeJS.ErrnoException | undefined)?.code;
-          if (code === "ERR_CHILD_PROCESS_STDOUT_MAXBUFFER") {
-            return ctx.ui.notify(
-              `Diff from ${diffSource} exceeds the ${Math.floor(DIFF_EXEC_MAX_BUFFER / (1024 * 1024))}MB capture limit — ` +
-                `narrow the target (e.g. a specific file or path) and try again.`,
-              "error",
+        if (!input) {
+          try {
+            const discovered = await discoverCodeReviewAutoScope(cwd);
+            if (discovered.excluded.length > 0 && discovered.included.length === 0) {
+              return ctx.ui.notify(
+                `Auto-scope skipped all ${discovered.excluded.length.toLocaleString()} tracked changes as ` +
+                  `high-confidence generated/cache artifacts. Use /code-review <path> to review one explicitly.`,
+                "warning",
+              );
+            }
+            if (discovered.excluded.length > 0) {
+              cmd = "git";
+              cmdArgs = buildAutoScopedDiffArgs(discovered);
+              autoScope = discovered;
+              diffSource =
+                `git diff HEAD (auto-scope: ${discovered.included.length.toLocaleString()} included, ` +
+                `${discovered.excluded.length.toLocaleString()} artifacts skipped)`;
+            } else {
+              cmd = "git";
+              cmdArgs = [...BARE_DIFF_HEAD_ARGS];
+            }
+          } catch (error) {
+            ctx.ui.notify(
+              `Auto-scope unavailable (${shortError(error)}); reviewing the full git diff HEAD without skipping files.`,
+              "warning",
             );
+            cmd = "git";
+            cmdArgs = [...BARE_DIFF_HEAD_ARGS];
           }
-          return ctx.ui.notify(
-            `Failed to get diff (${diffSource}): ${err instanceof Error ? err.message : err}`,
-            "error",
-          );
+        } else if (/^\d+$/.test(input)) {
+          diffSource = `gh pr diff ${input}`;
+          cmd = "gh";
+          cmdArgs = ["pr", "diff", input];
+        } else if (input.includes("..")) {
+          diffSource = `git diff ${input}`;
+          cmd = "git";
+          cmdArgs = ["diff", input];
+        } else {
+          diffSource = `git diff HEAD -- ${input}`;
+          cmd = "git";
+          cmdArgs = ["diff", "HEAD", "--", input];
         }
 
-        // The workflow itself also caps prompt size (MAX_DIFF_CHARS), but truncating
-        // here lets us tell the user clearly rather than have it happen silently deep
-        // inside the generated script.
-        const originalLength = diff.length;
+        let captured: CapturedCommandPrefix;
+        try {
+          captured = await captureCommandPrefix(cmd, cmdArgs, {
+            cwd,
+            maxChars: MAX_DIFF_CHARS,
+          });
+        } catch (error) {
+          if (!autoScope) {
+            return ctx.ui.notify(`Failed to get diff (${diffSource}): ${shortError(error)}`, "error");
+          }
+          ctx.ui.notify(
+            `Auto-scoped diff failed (${shortError(error)}); retrying the full git diff HEAD without skipping files.`,
+            "warning",
+          );
+          autoScope = undefined;
+          diffSource = "git diff HEAD";
+          try {
+            captured = await captureCommandPrefix("git", [...BARE_DIFF_HEAD_ARGS], {
+              cwd,
+              maxChars: MAX_DIFF_CHARS,
+            });
+          } catch (fallbackError) {
+            return ctx.ui.notify(`Failed to get diff (${diffSource}): ${shortError(fallbackError)}`, "error");
+          }
+        }
+
+        if (autoScope && !captured.stdout.trim()) {
+          ctx.ui.notify(
+            "Auto-scoped diff became empty while it was being collected; retrying the full git diff HEAD.",
+            "warning",
+          );
+          autoScope = undefined;
+          diffSource = "git diff HEAD";
+          try {
+            captured = await captureCommandPrefix("git", [...BARE_DIFF_HEAD_ARGS], {
+              cwd,
+              maxChars: MAX_DIFF_CHARS,
+            });
+          } catch (fallbackError) {
+            return ctx.ui.notify(`Failed to get diff (${diffSource}): ${shortError(fallbackError)}`, "error");
+          }
+        }
+
+        const diff = captured.stdout;
+        const originalLength = captured.totalChars;
+        if (!diff.trim()) return ctx.ui.notify(`No diff output from: ${diffSource}`, "warning");
+        if (autoScope) ctx.ui.notify(formatAutoScopeNotice(autoScope), "info");
+
         if (originalLength > MAX_DIFF_CHARS) {
-          diff = diff.slice(0, MAX_DIFF_CHARS);
           ctx.ui.notify(
             `Diff is ${originalLength.toLocaleString()} characters — truncated to the first ` +
               `${MAX_DIFF_CHARS.toLocaleString()} for the review. Findings past the cut are not covered.`,
