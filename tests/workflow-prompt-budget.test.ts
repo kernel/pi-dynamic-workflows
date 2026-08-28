@@ -58,7 +58,11 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 // instead. The exact wording increases the measured definition from 4,276
 // to 4,392 bytes (+116), and the accepted ceiling moves with it, from
 // 4,283 to 4,392.
-const TOOL_DEFINITION_BUDGET_BYTES = 4_392;
+//
+// Hypeship's requested-model route policy adds a preflight lookup plus
+// provider preferences for OpenAI, Anthropic, and other model families. The
+// provider-visible definition grows from 4,392 to 4,879 bytes (+487).
+const TOOL_DEFINITION_BUDGET_BYTES = 4_879;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {

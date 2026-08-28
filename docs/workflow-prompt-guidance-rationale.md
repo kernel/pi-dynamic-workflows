@@ -769,6 +769,28 @@ The runtime resolves explicit `model` before an `agentType`-bound model, `tier`,
 
 Confidence is very high that explicit `model` selection should only honor an exact user-named model, that authors should choose it instead of `tier`, and that concrete model-spec examples should be omitted from permanent guidance.
 
+### Resolve user-requested models through supported providers
+
+Add this route-selection policy to `script.description`:
+
+```text
+Use an explicit `model` only to honor a model the user requested. Before calling workflow, resolve that model with `pi --list-models <model-name>`. For OpenAI models, use the `openai-codex` provider and never Bedrock; if unavailable, ask the user to connect Codex. For Anthropic models, prefer `claude-bridge`, then `anthropic`, and never Bedrock or OpenRouter; if neither is available, ask the user to connect Claude. For other models, prefer the first-party provider, then OpenRouter.
+```
+
+#### Reasoning
+
+`pi --list-models` exposes provider and model as separate columns, so filtering by the requested model name avoids scanning or copying the full model catalogue into the prompt. Provider-qualified selection prevents ambient credentials from routing OpenAI or Anthropic requests through providers the user did not connect for workflow workers. Other model families retain a portable first-party-first rule with OpenRouter as the fallback.
+
+The parent resolves this before calling `workflow`, where it still has ordinary tools and can ask the user to connect an account. The workflow script then receives one concrete provider/model selection instead of trying unavailable routes inside background subagents.
+
+#### Evidence
+
+The provider-list command is Pi's documented `--list-models [search]` interface. The provider-selection order reflects the authenticated routes supported by the Hypeship fork: Codex for OpenAI, Claude subscription bridge before direct Anthropic, and first-party APIs before OpenRouter for other families.
+
+#### Confidence
+
+Confidence is high that provider-qualified preflight prevents the observed ambient-credential failures and that route discovery belongs next to the nested `model` option in `script.description`.
+
 ### Describe the structured-output return contract
 
 Replace:
