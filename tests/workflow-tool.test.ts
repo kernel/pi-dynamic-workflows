@@ -129,6 +129,13 @@ test("createWorkflowTool keeps script syntax in the parameter schema", () => {
   assert.match(description, /bind tools, a model, and role instructions/i);
   assert.match(description, /name and purpose.*provided in context/i);
   assert.match(description, /bound model overrides `tier`.*explicit `model` overrides both/i);
+  assert.match(description, /explicit `model` only to honor a model the user requested/i);
+  assert.match(description, /pi --list-models <model-name>/i);
+  assert.match(description, /OpenAI models.*`openai-codex` provider.*never Bedrock/i);
+  assert.match(description, /unavailable.*ask the user to connect Codex/i);
+  assert.match(description, /Anthropic models.*prefer `claude-bridge`, then `anthropic`.*never Bedrock or OpenRouter/i);
+  assert.match(description, /neither is available.*ask the user to connect Claude/i);
+  assert.match(description, /other models.*prefer the first-party provider, then OpenRouter/i);
   assert.match(description, /plain JavaScript only.*imports.*require\(\).*filesystem modules/i);
   assert.match(description, /Date\.now\(\).*Math\.random\(\).*new Date\(\).*unavailable/i);
   assert.match(description, /args, cwd, process\.cwd\(\), and budget/i);
