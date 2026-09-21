@@ -78,7 +78,7 @@ const workflowToolSchema = Type.Object({
   maxAgents: Type.Optional(
     Type.Number({
       description:
-        "Maximum number of agents allowed in this run. Default: 1000; this is a safety ceiling, not a target. Set a lower limit for dynamic or exploratory fan-out, and reserve large fan-outs for explicit user intent.",
+        "Agent cap (1000 default; safety). Count: verify=reviewers, judgePanel=entries×judges, completenessCheck=1. Retries add no slots. Lower for dynamic fan-out; large fan-outs need explicit user intent.",
     }),
   ),
   concurrency: Type.Optional(
@@ -158,16 +158,27 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
   const fallbackCwd = options.cwd ?? process.cwd();
   const fallbackStorage = options.storage ?? createWorkflowStorage(fallbackCwd);
   const defaults = resolveWorkflowToolDefaults(options, fallbackCwd);
-  const fallbackManager =
-    options.manager ??
-    new WorkflowManager({
-      cwd: options.cwd,
-      concurrency: defaults.concurrency,
-      loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
-      defaultAgentTimeoutMs: defaults.agentTimeoutMs,
-      defaultAgentRetries: defaults.agentRetries,
-    });
-  const getManager = () => options.getManager?.() ?? fallbackManager;
+  // Lazy (audit2 #38): WorkflowManager's constructor scans — and on stale-run
+  // recovery, REWRITES — the cwd's run store. Callers that only need the
+  // tool's schema/description (context measurement, release gate) must not
+  // touch the developer's real global store as a side effect.
+  let fallbackManager: WorkflowManager | undefined;
+  const getManager = () => {
+    const provided = options.getManager?.() ?? options.manager;
+    if (provided) return provided;
+    if (!fallbackManager) {
+      fallbackManager = new WorkflowManager({
+        // Bind to the factory-time cwd, not a re-read of process.cwd() at
+        // execute time (r1 NIT: split-brain with fallbackStorage).
+        cwd: options.cwd ?? fallbackCwd,
+        concurrency: defaults.concurrency,
+        loadSavedWorkflow: (name: string) => fallbackStorage.load(name)?.script,
+        defaultAgentTimeoutMs: defaults.agentTimeoutMs,
+        defaultAgentRetries: defaults.agentRetries,
+      });
+    }
+    return fallbackManager;
+  };
   const getStorage = () => options.getStorage?.() ?? fallbackStorage;
   const getCwd = () => options.getCwd?.() ?? fallbackCwd;
 
@@ -286,6 +297,20 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         showResultPreviews: false,
       });
 
+      // Coalesced progress rendering state (see onProgress below).
+      let latestProgress: WorkflowSnapshot | undefined;
+      let progressRenderTimer: ReturnType<typeof setTimeout> | undefined;
+      const flushProgress = () => {
+        if (progressRenderTimer) {
+          clearTimeout(progressRenderTimer);
+          progressRenderTimer = undefined;
+          if (latestProgress) {
+            snapshot = recomputeWorkflowSnapshot(latestProgress);
+            display.update(snapshot); // the last frame must not be 100ms stale
+          }
+        }
+      };
+
       let result: WorkflowRunResult;
       try {
         result = await manager.runSync(script, params.args, {
@@ -299,11 +324,23 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
           confirm,
           externalSignal: signal,
           onProgress(live) {
-            snapshot = recomputeWorkflowSnapshot(live);
-            display.update(snapshot);
+            // Trailing-edge coalescing (audit2 #24): with many concurrent
+            // agents, progress events fire hundreds of times per second and a
+            // full recompute+render each time stalls the host event loop.
+            latestProgress = live;
+            if (!progressRenderTimer) {
+              progressRenderTimer = setTimeout(() => {
+                progressRenderTimer = undefined;
+                if (latestProgress) {
+                  snapshot = recomputeWorkflowSnapshot(latestProgress);
+                  display.update(snapshot);
+                }
+              }, 100);
+            }
           },
         });
       } catch (error) {
+        flushProgress();
         if (signal?.aborted || (error instanceof WorkflowError && error.code === WorkflowErrorCode.WORKFLOW_ABORTED)) {
           for (const agent of snapshot.agents) {
             if (agent.status === "running") {
@@ -318,12 +355,14 @@ export function createWorkflowTool(options: WorkflowToolOptions = {}): ToolDefin
         throw error;
       }
 
+      flushProgress(); // no stray timer may survive ANY exit, incl. this throw
       if (result.agentCount === 0) {
         throw new Error(
           "workflow scripts must call agent() at least once; this workflow declared phases but did not run any subagents",
         );
       }
 
+      flushProgress();
       snapshot.result = result.result;
       snapshot.durationMs = result.durationMs;
       snapshot = recomputeWorkflowSnapshot(snapshot);

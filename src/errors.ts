@@ -55,6 +55,11 @@ export enum WorkflowErrorCode {
    * so retrying the same spec would fail identically every time.
    */
   MODEL_NOT_FOUND = "MODEL_NOT_FOUND",
+  /**
+   * A host preSpawnModel policy rejected this agent before createAgentSession.
+   * Distinct from MODEL_NOT_FOUND: the model may be available; the policy refused spawn.
+   */
+  MODEL_SPAWN_REJECTED = "MODEL_SPAWN_REJECTED",
   /** Agent execution failed. */
   AGENT_EXECUTION_ERROR = "AGENT_EXECUTION_ERROR",
   /** Run state persistence failed. */
@@ -84,6 +89,17 @@ export class WorkflowError extends Error {
     this.agentLabel = options.agentLabel;
     this.details = options.details;
     this.resetHint = options.resetHint;
+  }
+}
+
+/** Internal control signal used to suspend a run at a durable workflow checkpoint. */
+export class WorkflowCheckpointSuspensionError extends Error {
+  readonly checkpointId: string;
+
+  constructor(checkpointId: string) {
+    super(`workflow checkpoint ${JSON.stringify(checkpointId)} is waiting for a response`);
+    this.name = "WorkflowCheckpointSuspensionError";
+    this.checkpointId = checkpointId;
   }
 }
 
@@ -144,7 +160,10 @@ export function classifyProviderLimit(text: string | undefined): { matched: bool
       text,
     );
   if (!matched) return { matched: false };
-  const reset = text.match(/resets?\s+(?:in|at)\s+[^.\n]+/i);
+  // "Resets in ~3h", "reset at 2026-09-17 13:20:54 +0800", and the pi-ai
+  // Codex form "Try again in ~299 min" (audit2 #10 — the extraction must reach
+  // the scheduler verbatim; parseResetHintMs understands all three shapes).
+  const reset = text.match(/(?:resets?\s+(?:in|at)|try again\s+in)\s+[^.\n]+/i);
   return { matched: true, resetHint: reset?.[0]?.trim() };
 }
 

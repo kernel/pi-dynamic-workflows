@@ -61,8 +61,8 @@ const RENDERED_PROMPT_BUDGET_BYTES = 800;
 //
 // Hypeship's requested-model route policy adds a preflight lookup plus
 // provider preferences for OpenAI, Anthropic, and other model families. The
-// provider-visible definition grows from 4,392 to 4,879 bytes (+487).
-const TOOL_DEFINITION_BUDGET_BYTES = 4_879;
+// provider-visible definition grows from 4,383 to 4,870 bytes (+487).
+const TOOL_DEFINITION_BUDGET_BYTES = 4_870;
 
 test("rendered workflow prompt contribution stays within its accepted size", async () => {
   await withRenderedWorkflow(async ({ systemPrompt, promptLines }) => {
@@ -136,7 +136,7 @@ async function withRenderedWorkflow(
         assert.ok(wrappedWorkflow, "Pi should expose the wrapped workflow tool");
 
         await inspect({
-          systemPrompt: session.agent.state.systemPrompt,
+          systemPrompt: session.systemPrompt,
           promptLines: [
             `- workflow: ${workflow.promptSnippet}`,
             ...workflow.promptGuidelines.map((guideline) => `- ${guideline}`),

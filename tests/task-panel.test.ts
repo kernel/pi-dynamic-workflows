@@ -1,17 +1,189 @@
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { appendFileSync, mkdtempSync, renameSync, rmSync, truncateSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { before, beforeEach, describe, it } from "node:test";
+import { after, before, beforeEach, describe, it } from "node:test";
 import { AgentSession, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { visibleWidth } from "@earendil-works/pi-tui";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { UsageLimitScheduler } from "../src/usage-limit-scheduler.js";
+import { WorkflowManager } from "../src/workflow-manager.js";
 
 type DeliveryCall = { content: string; customType?: string; triggerTurn?: boolean };
 type StableSend = (
-  msg: { customType?: string; content?: string; display?: boolean },
+  msg: { customType?: string; content?: string; display?: boolean; details?: { deliveryId?: string } },
   opts?: { triggerTurn?: boolean; deliverAs?: string },
 ) => unknown;
 
+const lifecycleScript = `export const meta = { name: 'lifecycle_delivery', description: 'delivery lifecycle test' }
+const result = await agent('wait for control')
+return { result }`;
+
+function controlledAgent() {
+  const resolvers: Array<(value: unknown) => void> = [];
+  let calls = 0;
+  return {
+    runner: {
+      async run() {
+        calls++;
+        return new Promise<unknown>((resolve) => resolvers.push(resolve));
+      },
+    },
+    calls: () => calls,
+    resolve(index: number, value = "done") {
+      resolvers[index]?.(value);
+    },
+    async waitForCalls(expected: number) {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (calls >= expected) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail(`agent did not reach ${expected} calls (saw ${calls})`);
+    },
+  };
+}
+
+const fatalControlRaceScript = `export const meta = { name: 'fatal_control_race', description: 'run-fatal lifecycle race' }
+await parallel([
+  () => agent('fatal', { label: 'fatal' }),
+  () => agent('sibling', { label: 'sibling' }),
+])
+return 'unreachable'`;
+
+function fatalThenDrainAgent() {
+  let siblingAbortObserved = false;
+  let rejectSibling: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        if (prompt === "fatal") {
+          throw new WorkflowError("fatal sibling failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+            recoverable: false,
+          });
+        }
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectSibling = reject;
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              siblingAbortObserved = true;
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+    async waitForSiblingAbort() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (siblingAbortObserved) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("run-fatal signal did not reach the sibling");
+    },
+    settleSibling() {
+      rejectSibling?.(new Error("sibling drained after run-fatal"));
+    },
+  };
+}
+
+const usageLimitControlRaceScript = `export const meta = { name: 'usage_limit_control_race', description: 'usage-limit lifecycle race' }
+await parallel([
+  () => agent('quota', { label: 'quota' }),
+  () => agent('sibling', { label: 'sibling' }),
+])
+return 'unreachable'`;
+
+function usageLimitThenDrainAgent() {
+  let siblingAbortObserved = false;
+  let rejectSibling: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        if (prompt === "quota") {
+          throw new WorkflowError("quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+            recoverable: false,
+            resetHint: "Resets in 1m",
+          });
+        }
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectSibling = reject;
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              siblingAbortObserved = true;
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+    async waitForSiblingAbort() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (siblingAbortObserved) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("usage-limit fatal signal did not reach the sibling");
+    },
+    settleSibling() {
+      rejectSibling?.(new Error("sibling drained after usage limit"));
+    },
+  };
+}
+
+function lateUsageLimitAgent() {
+  let rejectAgent: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run() {
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectAgent = reject;
+        });
+      },
+    },
+    async waitForStart() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (rejectAgent) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("late provider-limit agent did not start");
+    },
+    rejectWithUsageLimit() {
+      rejectAgent?.(
+        new WorkflowError("late quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+          recoverable: false,
+          resetHint: "Resets in 1m",
+        }),
+      );
+    },
+  };
+}
+
+function lateErrorAgent() {
+  let rejectAgent: ((reason?: unknown) => void) | undefined;
+  return {
+    runner: {
+      async run() {
+        return new Promise<unknown>((_resolve, reject) => {
+          rejectAgent = reject;
+        });
+      },
+    },
+    async waitForStart() {
+      for (let attempt = 0; attempt < 100; attempt++) {
+        if (rejectAgent) return;
+        await new Promise((resolve) => setTimeout(resolve, 2));
+      }
+      assert.fail("late-error agent did not start");
+    },
+    rejectWith(error: Error) {
+      rejectAgent?.(error);
+    },
+  };
+}
+
 type TaskPanelModule = {
+  WORKFLOW_LIFECYCLE_EVENT: string;
   installResultDelivery: (pi: ExtensionAPI, manager: unknown, opts?: unknown) => void;
   bindSessionDelivery: (
     sessionId: string,
@@ -34,15 +206,18 @@ type TaskPanelModule = {
   dropSessionDelivery: (sessionId: string | undefined) => void;
   suspendResultDelivery: (manager: unknown) => void;
   resumeResultDelivery: (manager: unknown) => void;
+  _isProbedForTests: (sessionId: string) => boolean;
   suspendSessionDelivery: (sessionId: string | undefined) => void;
   resumeSessionDelivery: (sessionId: string | undefined, manager?: unknown) => void;
-  installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
   _resetDeliveryRegistriesForTests: () => void;
   _registerBoundSessionSendForTests: (sessionId: string, send: StableSend) => void;
-  _hasBoundSessionSendForTests: (sessionId: string) => boolean;
+  _registerHostSessionForTests: (session: object) => void;
+  DELIVERY_PROBE_CUSTOM_TYPE: string;
+  _getStealMapForTests: () => ReadonlyMap<string, StableSend>;
   _getSessionDeliveryEndpointForTests: (
     sessionId: string,
   ) => { suspended: boolean; generation: number; hasSend: boolean; hasAppend: boolean } | undefined;
+  installTaskPanel: (pi: ExtensionAPI | null, manager: unknown, ui: unknown) => void;
 };
 
 // Loaded once before all tests
@@ -56,6 +231,29 @@ before(async () => {
 
 describe("installResultDelivery", () => {
   const SESSION = "sess-test";
+  const deliveryHistoryRoots: string[] = [];
+
+  function createPersistedDeliveryHistory() {
+    const root = mkdtempSync(join(tmpdir(), "pi-delivery-history-"));
+    deliveryHistoryRoots.push(root);
+    const sessionFile = join(root, "session.jsonl");
+    writeFileSync(sessionFile, "\n");
+    type Entry = { id: string; type: string; customType: string; details?: unknown };
+    const branch: Entry[] = [];
+    return {
+      branch,
+      sessionFile,
+      append(entry: Entry) {
+        branch.push(entry);
+        appendFileSync(sessionFile, `${JSON.stringify(entry)}\n`);
+      },
+    };
+  }
+  type DeliveryHistory = ReturnType<typeof createPersistedDeliveryHistory>;
+
+  after(() => {
+    for (const root of deliveryHistoryRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+  });
 
   beforeEach(() => {
     mod._resetDeliveryRegistriesForTests();
@@ -129,9 +327,23 @@ describe("installResultDelivery", () => {
     return manager;
   }
 
-  function createMockPi(): ExtensionAPI & { _calls: DeliveryCall[] } {
+  function createMockPi(): ExtensionAPI & {
+    _calls: DeliveryCall[];
+    emit?: (event: string, ...args: unknown[]) => void;
+    _onCount: (event: string) => number;
+  } {
     const calls: DeliveryCall[] = [];
+    const events = new EventEmitter();
+    const handlers = new Map<string, Array<(...args: unknown[]) => void>>();
+    const registrations = new Map<string, number>();
     const obj = {
+      events: {
+        emit: (channel: string, data: unknown) => events.emit(channel, data),
+        on: (channel: string, handler: (data: unknown) => void) => {
+          events.on(channel, handler);
+          return () => events.off(channel, handler);
+        },
+      },
       sendMessage(msg: unknown, _opts?: unknown) {
         calls.push({
           content: (msg as { content?: string }).content ?? "",
@@ -139,36 +351,241 @@ describe("installResultDelivery", () => {
         });
       },
       registerTool: () => {},
-      on: () => {},
+      on: (event: string, handler: (...args: unknown[]) => void) => {
+        registrations.set(event, (registrations.get(event) ?? 0) + 1);
+        const list = handlers.get(event) ?? [];
+        list.push(handler);
+        handlers.set(event, list);
+        return () => {
+          const idx = list.indexOf(handler);
+          if (idx !== -1) list.splice(idx, 1);
+        };
+      },
+      emit: (event: string, ...args: unknown[]) => {
+        for (const handler of handlers.get(event) ?? []) {
+          handler(...args);
+        }
+      },
+      _onCount: (event: string) => registrations.get(event) ?? 0,
       getActiveTools: () => [],
       setActiveTools: () => {},
       reload: () => Promise.resolve(),
       _calls: calls,
     };
-    return obj as unknown as ExtensionAPI & { _calls: DeliveryCall[] };
+    return obj as unknown as ExtensionAPI & {
+      _calls: DeliveryCall[];
+      emit?: (event: string, ...args: unknown[]) => void;
+    };
   }
 
   /** Session-stable thenable send that records like the old sendMessage spy. */
   function recordingStableSend(pi: { _calls: DeliveryCall[] }): StableSend {
-    return (msg, opts) => {
+    return function recordingStableSend(this: unknown, msg, opts) {
       pi._calls.push({
         content: msg.content ?? "",
         customType: msg.customType,
         triggerTurn: opts?.triggerTurn,
       });
+      const fixture = this as {
+        __deliveryEntries?: Array<Record<string, unknown>>;
+        __deliveryHistory?: DeliveryHistory;
+      };
+      const deliveryId = msg.details?.deliveryId;
+      if (deliveryId && fixture.__deliveryHistory) {
+        fixture.__deliveryHistory.append({
+          id: `entry-${fixture.__deliveryHistory.branch.length}`,
+          type: "custom_message",
+          customType: msg.customType ?? "workflow-result",
+          details: msg.details,
+        });
+      }
+      if (deliveryId && fixture.__deliveryEntries) {
+        fixture.__deliveryEntries.push({
+          type: "custom_message",
+          customType: msg.customType,
+          details: msg.details,
+        });
+      }
       return Promise.resolve();
     };
   }
 
-  /** Drive the armed AgentSession._bindExtensionCore patch with a fake `this`. */
-  function invokePatchedBindCore(session: object): void {
-    const bind = (AgentSession.prototype as unknown as { _bindExtensionCore: (runner: unknown) => unknown })
-      ._bindExtensionCore;
-    bind.call(session, { bindCore() {} });
+  type ExactSendCall = {
+    message: { customType?: string; content?: string; display?: boolean; details?: { deliveryId?: string } };
+    options: { triggerTurn?: boolean; deliverAs?: string } | undefined;
+  };
+  /** Record the FULL message + options so tests can assert the exact payload
+   *  the delivery path hands to the captured host send (T1). */
+  function recordingSendExact(calls: ExactSendCall[]): StableSend {
+    return function recordingSendExact(this: unknown, msg, opts) {
+      calls.push({ message: { ...msg }, options: opts ? { ...opts } : undefined });
+      const fixture = this as {
+        __deliveryEntries?: Array<Record<string, unknown>>;
+        __deliveryHistory?: DeliveryHistory;
+      };
+      const deliveryId = msg.details?.deliveryId;
+      if (deliveryId && fixture.__deliveryHistory) {
+        fixture.__deliveryHistory.append({
+          id: `entry-${fixture.__deliveryHistory.branch.length}`,
+          type: "custom_message",
+          customType: msg.customType ?? "workflow-result",
+          details: msg.details,
+        });
+      }
+      if (deliveryId && fixture.__deliveryEntries) {
+        fixture.__deliveryEntries.push({
+          type: "custom_message",
+          customType: msg.customType,
+          details: msg.details,
+        });
+      }
+      return Promise.resolve();
+    };
+  }
+
+  /**
+   * Drive the armed AgentSession.sendCustomMessage capture patch with a fake
+   * `this` to exercise the steal filter. The patched forward runs the REAL
+   * sendCustomMessage, so an untriggered call is used: the non-trigger branch
+   * only needs `agent.state.messages` and `sessionManager.appendCustomMessageEntry`,
+   * both provided below — avoiding `_runAgentPrompt`'s internal fields.
+   */
+  function invokePatchedSendCustomMessage(
+    session: object,
+    message?: { customType: string; content: string; display: boolean },
+  ): void {
+    const patched = (AgentSession.prototype as unknown as { sendCustomMessage?: unknown }).sendCustomMessage;
+    assert.equal(typeof patched, "function", "sendCustomMessage patch must be armed");
+    // Pi 0.85.1 moved custom-message persistence behind private prototype
+    // helpers. Use the real prototype while retaining explicit own fake state.
+    Object.setPrototypeOf(session, AgentSession.prototype);
+    const fixture = session as {
+      __deliveryEntries?: Array<Record<string, unknown>>;
+      __deliveryHistory?: DeliveryHistory;
+      isIdle?: boolean;
+      subscribe?: () => () => void;
+      sessionManager?: Record<string, unknown>;
+    };
+    const entries = fixture.__deliveryEntries ?? [];
+    fixture.__deliveryEntries = entries;
+    const history = fixture.__deliveryHistory ?? createPersistedDeliveryHistory();
+    fixture.__deliveryHistory = history;
+    if (fixture.isIdle == null) fixture.isIdle = true;
+    if (!Object.hasOwn(session, "_isAgentRunActive")) {
+      Object.assign(session, { _isAgentRunActive: false });
+    }
+    if (!Object.hasOwn(session, "subscribe")) fixture.subscribe = () => () => {};
+    if (!Object.hasOwn(session, "agent")) {
+      Object.assign(session, { agent: { state: { messages: [] } } });
+    }
+    if (!Object.hasOwn(session, "sessionManager")) {
+      Object.assign(session, {
+        sessionManager: {
+          appendCustomMessageEntry: () => "",
+          getEntries: () => entries,
+          getBranch: () => history.branch,
+          getSessionFile: () => history.sessionFile,
+        },
+      });
+    } else {
+      const sm = (session as { sessionManager?: Record<string, unknown> }).sessionManager;
+      if (!sm || !("appendCustomMessageEntry" in sm)) {
+        // Never inherit a host-shaped sessionManager from the real prototype: a
+        // fake session must carry exactly the fields the untriggered forward
+        // touches, and never the real session's identity (T2). MERGE the
+        // appendCustomMessageEntry onto the test-provided sessionManager so we
+        // do not destroy its persist/getSessionId/isPersisted shape (T6).
+        Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
+          appendCustomMessageEntry: () => "",
+        });
+      }
+      if (!sm || !("getEntries" in sm)) {
+        Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
+          getEntries: () => entries,
+        });
+      }
+      if (!sm || !("getBranch" in sm)) {
+        Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
+          getBranch: () => history.branch,
+        });
+      }
+      if (!sm || !("getSessionFile" in sm)) {
+        Object.assign(sm ?? (session as { sessionManager: Record<string, unknown> }).sessionManager, {
+          getSessionFile: () => history.sessionFile,
+        });
+      }
+    }
+    if (!Object.hasOwn(session, "_emit")) {
+      Object.assign(session, { _emit: () => {} });
+    }
+    const state = session as { _isAgentRunActive?: boolean; _pendingCustomMessages?: unknown[] };
+    if (state._isAgentRunActive == null) state._isAgentRunActive = false;
+    if (state._pendingCustomMessages == null) state._pendingCustomMessages = [];
+    void (patched as (msg: unknown, opts: unknown) => unknown).call(
+      session,
+      message ?? { customType: "workflow-result", content: "x", display: true },
+      {},
+    );
+    // The capture call itself is only a fixture arm; it must not leave the
+    // fake host marked streaming before the later delivery under test.
+    state._isAgentRunActive = false;
+  }
+
+  /**
+   * Drive the armed AgentSession._bindExtensionCore capture patch with a fake
+   * `this`. The wrapper captures BEFORE forwarding to the REAL
+   * `_bindExtensionCore`, which a fake session cannot fully satisfy — the
+   * forward's throw is irrelevant (capture already happened) and is swallowed.
+   */
+  function invokePatchedBindExtensionCore(session: object): void {
+    const proto = AgentSession.prototype as unknown as { _bindExtensionCore?: unknown };
+    const patched = proto._bindExtensionCore;
+    assert.equal(typeof patched, "function", "_bindExtensionCore patch must be armed");
+    try {
+      (patched as (runner: unknown) => unknown).call(session, {
+        bindCore: () => {},
+        getRegisteredCommands: () => [],
+      });
+    } catch {
+      // The real bindCore body may touch internals a fake session lacks.
+    }
+  }
+  /**
+   * Wrap a fake host send so the delivery path's captured-send invocation runs
+   * with the internals the REAL AgentSession.sendCustomMessage touches
+   * (the fix forwards on the live receiver). The wrapped send is the function
+   * under test. The stub's job is only to make `this` look like a real host
+   * session — it must NEVER overwrite the fakes the test installed (T3).
+   */
+  function captureStub(send: StableSend): StableSend {
+    return function captureStub(this: unknown, msg, opts) {
+      const s = this as {
+        agent?: { state: { messages: unknown[] }; followUp?: () => void };
+        sessionManager?: { appendCustomMessageEntry?: () => unknown };
+        _isAgentRunActive?: boolean;
+        _pendingNextTurnMessages?: unknown[];
+        _followUpMessages?: unknown[];
+        _emit?: (e: unknown) => void;
+      };
+      if (s.agent == null) s.agent = { state: { messages: [] }, followUp: () => {} };
+      if (s.sessionManager == null) s.sessionManager = { appendCustomMessageEntry: () => "" };
+      if (s._pendingNextTurnMessages == null) s._pendingNextTurnMessages = [];
+      if (s._followUpMessages == null) s._followUpMessages = [];
+      if (s._emit == null) s._emit = () => {};
+      // Streaming route: the real sendCustomMessage queues via agent.followUp
+      // (never _runAgentPrompt) when isStreaming — avoids the prompt internals
+      // while still exercising the live-receiver forward.
+      if (s._isAgentRunActive == null) s._isAgentRunActive = true;
+      return send.call(this, msg, opts);
+    };
   }
 
   function piCalls(pi: ExtensionAPI): DeliveryCall[] {
-    return (pi as unknown as { _calls: DeliveryCall[] })._calls;
+    // The session_start probe rides the same sendMessage spy; only result
+    // deliveries count.
+    return (pi as unknown as { _calls: DeliveryCall[] })._calls.filter(
+      (c) => c.customType !== mod.DELIVERY_PROBE_CUSTOM_TYPE,
+    );
   }
 
   function makeRun(overrides: Record<string, unknown> = {}) {
@@ -406,6 +823,83 @@ describe("installResultDelivery", () => {
     assert.equal(calls.length, 1); // exactly once, not twice
   });
 
+  it("emits background lifecycle events through the latest extension runtime after reload", () => {
+    const stalePi = createMockPi();
+    const freshPi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const staleEvents: unknown[] = [];
+    const freshEvents: unknown[] = [];
+    stalePi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => staleEvents.push(event));
+    freshPi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => freshEvents.push(event));
+
+    setup(stalePi, manager);
+    mod.installResultDelivery(freshPi, manager);
+    for (const event of ["started", "resumed", "paused", "complete", "error", "stopped"]) {
+      manager.emit(event, { runId: "test-run-1" });
+    }
+
+    assert.deepEqual(staleEvents, []);
+    assert.deepEqual(
+      freshEvents,
+      ["started", "resumed", "paused", "completed", "failed", "stopped"].map((status) => ({
+        status,
+        runId: "test-run-1",
+        name: "test-workflow",
+        sessionId: SESSION,
+      })),
+    );
+  });
+
+  it("emits a stopped lifecycle event for a persisted-only run through the latest runtime", () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-cold-stop-event-"));
+    const manager = new WorkflowManager({ cwd });
+    const stalePi = createMockPi();
+    const freshPi = createMockPi();
+    const staleEvents: unknown[] = [];
+    const freshEvents: unknown[] = [];
+    const runId = "cold-start-stop-paused-1";
+    stalePi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => staleEvents.push(event));
+    freshPi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => freshEvents.push(event));
+
+    try {
+      manager.getPersistence().save({
+        runId,
+        workflowName: "cold_start_stop",
+        script: lifecycleScript,
+        sessionId: SESSION,
+        status: "paused",
+        phases: [],
+        agents: [],
+        logs: [],
+        startedAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+      mod.installResultDelivery(stalePi, manager);
+      mod.installResultDelivery(freshPi, manager);
+
+      assert.equal(manager.getRun(runId), undefined);
+      assert.equal(manager.stop(runId), true);
+      assert.deepEqual(staleEvents, []);
+      assert.deepEqual(freshEvents, [{ status: "stopped", runId, name: "cold_start_stop", sessionId: SESSION }]);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not emit lifecycle events for foreground runs", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ background: false }));
+    const events: unknown[] = [];
+    pi.events.on(mod.WORKFLOW_LIFECYCLE_EVENT, (event) => events.push(event));
+
+    setup(pi, manager);
+    for (const event of ["started", "resumed", "paused", "complete", "error", "stopped"]) {
+      manager.emit(event, { runId: "test-run-1" });
+    }
+
+    assert.deepEqual(events, []);
+  });
+
   it("does not crash when sendMessage throws (stale ctx); queues and flushes on rebind", async () => {
     const stalePi = {
       sendMessage: (_msg: unknown, _opts?: unknown) => {
@@ -548,47 +1042,657 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("test-workflow"));
   });
 
-  it("keeps the generation-change retry locked until its send settles", async () => {
-    let rejectStale: ((err: Error) => void) | undefined;
-    let resolveRetry: (() => void) | undefined;
-    let retryCalls = 0;
-    const stalePi = createMockPi();
-    const retryPi = createMockPi();
-    const reboundPi = createMockPi();
+  it("flushes pending delivery when an old generation succeeds after a new generation binds", async () => {
+    let resolveSend: (() => void) | undefined;
+    const oldPi = createMockPi();
+    const freshPi = createMockPi();
     const manager = createMockManager(makeRun());
 
-    setup(stalePi, manager, SESSION, {
+    setup(oldPi, manager, SESSION, {
       stableSend: () =>
-        new Promise<void>((_resolve, reject) => {
-          rejectStale = reject;
+        new Promise<void>((resolve) => {
+          resolveSend = resolve;
         }),
     });
     manager.emit("complete", { runId: "test-run-1" });
+    assert.ok(resolveSend, "old generation owns the in-flight send");
 
-    mod.bindSessionDelivery(SESSION, retryPi as unknown as ExtensionAPI, {
-      manager,
+    mod.bindSessionDelivery(SESSION, freshPi, { manager, stableSend: recordingStableSend(freshPi) });
+    assert.equal(piCalls(freshPi).length, 0, "the pending old send still owns the lock before it settles");
+
+    resolveSend?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(piCalls(freshPi).length, 1, "old-generation success hands pending delivery to the new endpoint");
+    assert.equal(
+      manager.getPersistence?.().load("test-run-1")?.pendingDelivery,
+      undefined,
+      "the fresh endpoint clears its flushed pending marker",
+    );
+  });
+
+  it("hands a disk-only delivery to its persisted owner after an old send settles", async () => {
+    const oldSession = "old-session";
+    const newSession = "new-session";
+    let resolveOld: (() => void) | undefined;
+    const oldPi = createMockPi();
+    const newPi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: oldSession }));
+
+    setup(oldPi, manager, oldSession, {
+      stableSend: () =>
+        new Promise<void>((resolve) => {
+          resolveOld = resolve;
+        }),
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.ok(resolveOld, "the old owner has an in-flight delivery");
+
+    const persistence = manager.getPersistence?.();
+    const state = persistence?.load("test-run-1");
+    assert.ok(state?.pendingDelivery, "the marker is durable before ownership changes");
+    persistence?.save({ ...state, sessionId: newSession });
+    manager.getRun = () => undefined;
+
+    mod.bindSessionDelivery(newSession, newPi, { manager, stableSend: recordingStableSend(newPi) });
+    mod.dropSessionDelivery(oldSession);
+    assert.equal(piCalls(newPi).length, 0, "the old in-flight lock prevents an early duplicate");
+
+    resolveOld?.();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(piCalls(newPi).length, 1, "old settlement flushes to the persisted disk-only owner");
+    assert.equal(persistence?.load("test-run-1")?.pendingDelivery, undefined);
+  });
+
+  it("a failed send overlapping a re-bind cannot double-deliver", async () => {
+    // Generation N's send fails; the generation-change retry re-arms the lock
+    // (new token) and starts send 2. N's stale .finally must NOT release the
+    // lock T2 holds — otherwise a third caller could start a duplicate send.
+    const resolvers: Array<(err: Error) => void> = [];
+    let sends = 0;
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: SESSION, runId: "run-double" }));
+    const stableSend: StableSend = () => {
+      sends++;
+      return new Promise<never>((_resolve, reject) => {
+        resolvers.push(reject);
+      });
+    };
+    setup(pi, manager, SESSION, { stableSend });
+    manager.emit("complete", { runId: "run-double" });
+    assert.equal(sends, 1, "first in-flight send");
+
+    mod.bindSessionDelivery(SESSION, pi, { manager, stableSend }); // generation bump
+    resolvers[0](new Error("send failed")); // fail send 1 → release + generation retry
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(sends, 2, "generation-change flush retries the send exactly once");
+
+    manager.emit("complete", { runId: "run-double" });
+    assert.equal(sends, 2, "the retried send keeps its lock — no third delivery");
+    resolvers[1]?.(new Error("test cleanup"));
+  });
+
+  it("retries a transient rejection without waiting for another session bind", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let sends = 0;
+
+    setup(pi, manager, SESSION, {
       stableSend: () => {
-        retryCalls += 1;
-        return new Promise<void>((resolve) => {
-          resolveRetry = resolve;
-        });
+        sends++;
+        return sends === 1 ? Promise.reject(new Error("temporary send failure")) : Promise.resolve();
       },
     });
-    rejectStale?.(new Error("late network blip"));
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    assert.equal(retryCalls, 1, "the new generation starts one retry");
+    manager.emit("complete", { runId: "test-run-1" });
 
-    mod.bindSessionDelivery(SESSION, reboundPi as unknown as ExtensionAPI, {
-      manager,
-      stableSend: recordingStableSend(reboundPi),
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sends, 2, "the live endpoint retries once without a rebind");
+    assert.equal(run.pendingDelivery, undefined, "the successful retry clears pending delivery");
+  });
+
+  it("does not send until the pending marker is durable", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const getPersistence = manager.getPersistence;
+    let failSave = true;
+    let sends = 0;
+    manager.getPersistence = () => {
+      const persistence = getPersistence?.();
+      assert.ok(persistence);
+      return {
+        ...persistence,
+        save: (state: Record<string, unknown>) => {
+          if (failSave) {
+            failSave = false;
+            throw new Error("disk temporarily unavailable");
+          }
+          persistence.save(state);
+        },
+      };
+    };
+
+    setup(pi, manager, SESSION, {
+      stableSend: () => {
+        sends++;
+        return Promise.resolve();
+      },
     });
-    assert.equal(piCalls(reboundPi).length, 0, "a rebind must not duplicate the in-flight retry");
+    manager.emit("complete", { runId: "test-run-1" });
+    assert.equal(sends, 0, "an unpersisted marker is never sent");
 
-    resolveRetry?.();
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sends, 1, "delivery resumes after marker persistence recovers");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("keeps a bind without work TUI-safe and reports only when a delivery remains pending", () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const reports: string[] = [];
+    const originalWarn = console.warn;
+    const startupWarnings: unknown[][] = [];
+    console.warn = (...args: unknown[]) => startupWarnings.push(args);
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, {
+        manager,
+        reportWarning: (message) => reports.push(message),
+      });
+
+      assert.deepEqual(startupWarnings, [], "bind must not write raw startup diagnostics over the TUI");
+      assert.deepEqual(reports, [], "no warning before there is a pending delivery");
+
+      manager.emit("complete", { runId: "test-run-1" });
+      assert.ok(run.pendingDelivery, "completion persists its marker before delivery is attempted");
+      assert.equal(reports.length, 1, "a deferred pending delivery is surfaced through the UI-safe reporter");
+      assert.deepEqual(startupWarnings, [], "delivery diagnostics must not use console.warn");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it("waits for an idle host, ignores queue_update, and ACKs only durable history", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const history = createPersistedDeliveryHistory();
+    const sent: Array<{ customType: string; content: string; display: boolean; details?: { deliveryId?: string } }> =
+      [];
+    const listeners = new Set<
+      (event: {
+        type?: string;
+        message?: { role?: string; customType?: string; details?: unknown };
+        followUp?: unknown[];
+      }) => void
+    >();
+    const emit = (event: {
+      type?: string;
+      message?: { role?: string; customType?: string; details?: unknown };
+      followUp?: unknown[];
+    }) => {
+      for (const listener of listeners) listener(event);
+    };
+
+    const session = {
+      isStreaming: true,
+      isIdle: false,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getBranch: () => history.branch,
+        getSessionFile: () => history.sessionFile,
+      },
+      subscribe: (
+        next: (event: { type?: string; message?: { role?: string; customType?: string; details?: unknown } }) => void,
+      ) => {
+        listeners.add(next);
+        return () => listeners.delete(next);
+      },
+      sendCustomMessage: (message: (typeof sent)[number]) => {
+        assert.equal(session.isStreaming, false, "busy hosts must not receive a custom follow-up");
+        sent.push(message);
+        return Promise.resolve();
+      },
+    };
+    mod._registerHostSessionForTests(session);
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sent.length, 0, "busy host receives no result send");
+    emit({ type: "queue_update", followUp: [] });
+    await Promise.resolve();
+    assert.equal(sent.length, 0, "queue_update is not an idle or retry signal");
+    session.isStreaming = false;
+    session.isIdle = true;
+    emit({ type: "agent_settled" });
+    await Promise.resolve();
+    assert.equal(sent.length, 1, "idle host receives exactly one result send");
+    assert.ok(run.pendingDelivery, "send acceptance alone must not clear the marker");
+    const details = sent[0].details;
+    emit({ type: "message_end", message: { role: "custom", customType: "workflow-result", details } });
+    history.append({ id: "delivery-entry", type: "custom_message", customType: "workflow-result", details });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(run.pendingDelivery, undefined, "matching durable message_end ACKs the delivery");
+  });
+
+  it("fails closed when idle-host message persistence cannot be inspected", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      isIdle: false,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => {
+          throw new Error("history unavailable");
+        },
+      },
+      subscribe: () => () => {},
+      sendCustomMessage: () => Promise.resolve(),
+    });
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.ok(run.pendingDelivery, "an unverifiable message_end cannot ACK delivery");
+  });
+
+  it("suspending an unsent idle waiter leaves its durable marker for the replacement", async () => {
+    const oldPi = createMockPi();
+    const freshPi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let sent = 0;
+
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      isIdle: false,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: () => () => {},
+      sendCustomMessage: () => {
+        sent++;
+        return Promise.resolve();
+      },
+    });
+    mod.installResultDelivery(oldPi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, oldPi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    assert.equal(sent, 0, "the busy generation owns no custom queue item");
+    assert.ok(run.pendingDelivery, "the unsent marker remains durable");
+
+    mod.suspendSessionDelivery(SESSION);
+    mod.bindSessionDelivery(SESSION, freshPi, { manager, stableSend: recordingStableSend(freshPi) });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(piCalls(freshPi).length, 1, "the replacement session receives the pending result");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("retries a failed marker clear without delivering the result twice", async () => {
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    const getPersistence = manager.getPersistence;
+    let failClear = true;
+    let sends = 0;
+    manager.getPersistence = () => {
+      const persistence = getPersistence?.();
+      assert.ok(persistence);
+      return {
+        ...persistence,
+        save: (state: Record<string, unknown>) => {
+          if (failClear && !("pendingDelivery" in state)) {
+            failClear = false;
+            throw new Error("disk temporarily unavailable");
+          }
+          persistence.save(state);
+        },
+      };
+    };
+
+    setup(pi, manager, SESSION, {
+      stableSend: () => {
+        sends++;
+        return Promise.resolve();
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    assert.ok(run.pendingDelivery, "failed clear keeps the marker until persistence recovers");
+
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(sends, 1, "clear retries never resend an already delivered result");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("deduplicates a stale marker against the originating session history", async () => {
+    const deliveryId = "existing-delivery";
+    const pi = createMockPi();
+    const run = makeRun({ pendingDelivery: { kind: "complete", deliveryId } });
+    const manager = createMockManager(run);
+    let sends = 0;
+    const history = createPersistedDeliveryHistory();
+    history.append({
+      id: "persisted-delivery",
+      type: "custom_message",
+      customType: "workflow-result",
+      details: { deliveryId },
+    });
+
+    mod._registerHostSessionForTests({
+      isStreaming: false,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getBranch: () => history.branch,
+        getSessionFile: () => history.sessionFile,
+      },
+      sendCustomMessage: () => {
+        sends++;
+        return Promise.resolve();
+      },
+    });
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(sends, 0, "an already persisted delivery is not sent twice");
+    assert.equal(run.pendingDelivery, undefined, "the stale marker is cleared");
+  });
+
+  it("does not let an older ACK clear a newer delivery marker", async () => {
+    const resolvers: Array<() => void> = [];
+    const sent: Array<{ details?: { deliveryId?: string } }> = [];
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+
+    setup(pi, manager, SESSION, {
+      stableSend: (message) => {
+        sent.push(message);
+        return new Promise<void>((resolve) => resolvers.push(resolve));
+      },
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    const firstId = run.pendingDelivery?.deliveryId;
+    manager.emit("error", { runId: "test-run-1", error: { message: "newer failure" } });
+    const newer = run.pendingDelivery;
+    assert.equal(newer?.kind, "text");
+    assert.notEqual(newer?.deliveryId, firstId);
+
+    resolvers[0]();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sent.length, 2, "the newer marker is flushed after the older ACK settles");
+    assert.equal(run.pendingDelivery?.deliveryId, newer?.deliveryId, "the old ACK cannot clear the newer marker");
+
+    resolvers[1]();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("cancels active streaming waiters on suspend so they cannot ACK a later generation", async () => {
+    const pi = createMockPi();
+    const freshPi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+    let gen1Listener:
+      | ((event: { type?: string; message?: { role?: string; customType?: string; details?: unknown } }) => void)
+      | undefined;
+
+    mod._registerHostSessionForTests({
+      isStreaming: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getEntries: () => [],
+      },
+      subscribe: (next: typeof gen1Listener) => {
+        gen1Listener = next;
+        return () => {
+          if (gen1Listener === next) gen1Listener = undefined;
+        };
+      },
+      sendCustomMessage: () => {
+        return Promise.resolve();
+      },
+    });
+
+    mod.installResultDelivery(pi, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    assert.ok(run.pendingDelivery);
+
+    // Suspend generation 1
+    mod.suspendSessionDelivery(SESSION);
+
+    // Generation 1's subscriber should have been unsubscribed by suspend
+    assert.equal(gen1Listener, undefined, "streaming waiter was unsubscribed on suspend");
+
+    // Bind generation 2
+    mod.bindSessionDelivery(SESSION, freshPi, { manager, stableSend: recordingStableSend(freshPi) });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(piCalls(freshPi).length, 1, "generation 2 received the pending delivery");
+    assert.equal(run.pendingDelivery, undefined);
+  });
+
+  it("ignores late ACK if the endpoint generation has changed", async () => {
+    let resolveSend: (() => void) | undefined;
+    const pi = createMockPi();
+    const run = makeRun();
+    const manager = createMockManager(run);
+
+    setup(pi, manager, SESSION, {
+      stableSend: () =>
+        new Promise<void>((resolve) => {
+          resolveSend = resolve;
+        }),
+    });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+    const deliveryId = run.pendingDelivery?.deliveryId;
+    assert.ok(deliveryId);
+
+    // Rebind session (bumps endpoint generation)
+    mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: () => Promise.resolve() });
+
+    // Old send resolves late
+    resolveSend?.();
     await Promise.resolve();
     await Promise.resolve();
+
+    // The stale send resolution must not have cleared the pending marker
+    assert.equal(run.pendingDelivery?.deliveryId, deliveryId, "stale generation send cannot ACK");
+  });
+
+  it("registers turn_end once per process and dispatches to the CURRENT manager (audit2 #33)", async () => {
+    const pi = createMockPi();
+    // m1 = the OLD project's manager; m2 = current after a cross-project
+    // session_start rebuild. Per-manager registration would stack one handler
+    // per rebuild, each closing over its own (stale) manager.
+    const m1 = createMockManager(makeRun());
+    m1.setSessionId("sess-old");
+    const m2 = createMockManager(makeRun());
+    m2.setSessionId("sess-new");
+
+    mod.installResultDelivery(pi, m1);
+    mod.installResultDelivery(pi, m2);
+
+    // Stolen sends for BOTH sessions: any handler that fires and resolves a
+    // sid will bind an endpoint for it. A stacked stale handler would bind
+    // sess-old too; the single process-wide dispatch must bind ONLY sess-new.
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-old", stableSend);
+    mod._registerBoundSessionSendForTests("sess-new", stableSend);
+
+    pi.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-new"), "turn_end dispatched to the current manager");
+    assert.equal(
+      mod._getSessionDeliveryEndpointForTests("sess-old"),
+      undefined,
+      "no stacked stale handler binding the old manager's session",
+    );
+  });
+
+  it("registers turn_end per ExtensionAPI generation, not once per process (audit2 #33 r1)", async () => {
+    // r1 MAJOR 2: the built dist module is cached across pi session
+    // generations while pi re-runs the factory with a NEW ExtensionAPI — a
+    // bare module-level boolean would leave generations 2+ with NO turn_end
+    // handler (fail-closed deliveries never re-probed until session_start).
+    const pi1 = createMockPi();
+    const pi2 = createMockPi();
+    const m1 = createMockManager(makeRun());
+    m1.setSessionId("sess-g1");
+    const m2 = createMockManager(makeRun());
+    m2.setSessionId("sess-g2");
+
+    mod.installResultDelivery(pi1, m1);
+    mod.installResultDelivery(pi2, m2); // generation 2: same module, NEW pi
+
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-g2", stableSend);
+
+    pi2.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-g2"), "generation-2 pi must have its own turn_end handler");
+  });
+
+  it("keeps A/B/A turn_end handlers per instance and dispatches each to its latest manager", async () => {
+    const piA = createMockPi();
+    const piB = createMockPi();
+    const oldA = createMockManager(makeRun());
+    oldA.setSessionId("sess-a-old");
+    const managerB = createMockManager(makeRun());
+    managerB.setSessionId("sess-b");
+    const latestA = createMockManager(makeRun());
+    latestA.setSessionId("sess-a-new");
+
+    mod.installResultDelivery(piA, oldA);
+    mod.installResultDelivery(piB, managerB);
+    mod.installResultDelivery(piA, latestA);
+
+    assert.equal(piA._onCount("turn_end"), 1, "A registers turn_end once across A/B/A installs");
+    assert.equal(piB._onCount("turn_end"), 1, "B registers turn_end once");
+
+    const stableSend: StableSend = () => Promise.resolve();
+    mod._registerBoundSessionSendForTests("sess-a-old", stableSend);
+    mod._registerBoundSessionSendForTests("sess-a-new", stableSend);
+    mod._registerBoundSessionSendForTests("sess-b", stableSend);
+
+    // No ctx means each callback must obtain the manager stored for ITS pi.
+    piA.emit?.("turn_end", {}, {});
+    piB.emit?.("turn_end", {}, {});
+    await Promise.resolve();
+
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-a-new"), "A uses A's newest manager");
+    assert.ok(mod._getSessionDeliveryEndpointForTests("sess-b"), "B keeps B's own manager");
+    assert.equal(
+      mod._getSessionDeliveryEndpointForTests("sess-a-old"),
+      undefined,
+      "A's stale manager is never consulted",
+    );
+  });
+
+  it("refreshes a live same-pi endpoint to a newly installed manager without rebinding transport", async () => {
+    const pi = createMockPi();
+    const first = createMockManager(makeRun({ sessionId: SESSION }));
+    first.setSessionId(SESSION);
+    let sends = 0;
+    const stableSend: StableSend = () => {
+      sends++;
+      return Promise.resolve();
+    };
+    mod.installResultDelivery(pi, first);
+    mod.bindSessionDelivery(SESSION, pi, { manager: first, stableSend });
+    const endpointBefore = mod._getSessionDeliveryEndpointForTests(SESSION);
+    assert.ok(endpointBefore?.hasSend, "first manager binds the live session transport");
+
+    const second = createMockManager(
+      makeRun({ sessionId: SESSION, pendingDelivery: { kind: "text", text: "second-manager pending" } }),
+    );
+    second.setSessionId(SESSION);
+    mod.installResultDelivery(pi, second);
+
+    // No bind follows: turn_end must use the replacement manager but leave the
+    // current session endpoint's transport/generation/suspension untouched.
+    pi.emit?.("turn_end", {}, {});
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(sends, 1, "turn_end flushes the replacement manager's pending run");
+    assert.equal(second.getRun("test-run-1")?.pendingDelivery, undefined, "replacement manager receives the ACK");
+    assert.deepEqual(mod._getSessionDeliveryEndpointForTests(SESSION), endpointBefore);
+  });
+
+  it("recovers and flushes pending delivery on turn_end when sender becomes available", async () => {
+    let sends = 0;
+    const pi = createMockPi();
+    const run = makeRun({ sessionId: SESSION });
+    const manager = createMockManager(run);
+    manager.setSessionId(SESSION);
+
+    // Initial install: endpoint has NO thenable send function (fail-closed)
+    mod.installResultDelivery(pi, manager);
+    mod.bindSessionDelivery(SESSION, pi, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await Promise.resolve();
+
+    assert.equal(sends, 0, "no send while sender is unavailable");
+    assert.ok(run.pendingDelivery, "delivery stays pending");
+
+    // Sender becomes available without session_start
+    const stableSend: StableSend = () => {
+      sends++;
+      return Promise.resolve();
+    };
+    mod._registerBoundSessionSendForTests(SESSION, stableSend);
+
+    // A normal conversation turn ends
+    pi.emit?.("turn_end", {}, { sessionManager: { getSessionId: () => SESSION } });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(sends, 1, "pending delivery flushed on turn_end idle recovery");
+    assert.equal(run.pendingDelivery, undefined, "pending delivery cleared");
   });
 
   it("never silently drops pending deliveries when the queue grows past the soft cap", () => {
@@ -723,6 +1827,279 @@ describe("installResultDelivery", () => {
     assert.equal(calls.length, 0);
   });
 
+  it("does not deliver or trigger a turn when a real background run is manually paused, then resumes only explicitly", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-pause-delivery-"));
+    const agent = controlledAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    const pi = createMockPi();
+    const errors: unknown[] = [];
+    manager.on("error", (event) => errors.push(event));
+
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+      const { runId, promise } = manager.startInBackground(lifecycleScript);
+      await agent.waitForCalls(1);
+
+      assert.equal(manager.pause(runId), true);
+      agent.resolve(0);
+      await promise.catch(() => {});
+      await Promise.resolve();
+
+      assert.equal(manager.getRun(runId)?.status, "paused");
+      assert.equal(agent.calls(), 1, "pause must not restart the workflow");
+      assert.equal(errors.length, 0, "manual pause teardown is not an unexpected error");
+      assert.equal(piCalls(pi).length, 0, "manual pause must not deliver a failed background result");
+
+      assert.equal(await manager.resume(runId), true, "only an explicit resume restarts the workflow");
+      await agent.waitForCalls(2);
+      agent.resolve(1, "resumed");
+      await new Promise((resolve) => setTimeout(resolve, 10));
+
+      const calls = piCalls(pi);
+      assert.equal(calls.length, 1, "the explicitly resumed completion is delivered once");
+      assert.equal(calls[0].triggerTurn, true, "only the real completion continues the conversation");
+      assert.match(calls[0].content, /finished/);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not deliver or trigger a turn when a real background run is manually stopped", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-stop-delivery-"));
+    const agent = controlledAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    const pi = createMockPi();
+    const errors: unknown[] = [];
+    manager.on("error", (event) => errors.push(event));
+
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+      const { runId, promise } = manager.startInBackground(lifecycleScript);
+      await agent.waitForCalls(1);
+
+      assert.equal(manager.stop(runId), true);
+      agent.resolve(0);
+      await promise.catch(() => {});
+      await Promise.resolve();
+
+      assert.equal(manager.getRun(runId)?.status, "aborted");
+      assert.equal(errors.length, 0, "manual stop teardown is not an unexpected error");
+      assert.equal(piCalls(pi).length, 0, "manual stop must not deliver a failed background result");
+      assert.equal(await manager.resume(runId), false, "a stopped run remains non-resumable");
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still delivers an external abort when a later manual pause races its teardown", async () => {
+    const cwd = mkdtempSync(join(tmpdir(), "pi-dw-external-abort-delivery-"));
+    const agent = controlledAgent();
+    const manager = new WorkflowManager({ cwd, agent: agent.runner });
+    const pi = createMockPi();
+    const errors: unknown[] = [];
+    manager.on("error", (event) => errors.push(event));
+    const external = new AbortController();
+
+    try {
+      mod.installResultDelivery(pi, manager);
+      manager.setSessionId(SESSION);
+      mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+      const { runId, promise } = manager.startInBackground(lifecycleScript, undefined, {
+        externalSignal: external.signal,
+      });
+      await agent.waitForCalls(1);
+
+      external.abort();
+      assert.equal(manager.pause(runId), true, "a late pause must not reclassify the external abort");
+      agent.resolve(0);
+      await promise.catch(() => {});
+      await Promise.resolve();
+
+      assert.equal(manager.getRun(runId)?.status, "aborted");
+      assert.equal(errors.length, 1, "an external abort remains observable as an error");
+      const calls = piCalls(pi);
+      assert.equal(calls.length, 1, "an external abort remains visible to the originating conversation");
+      assert.equal(calls[0].triggerTurn, true);
+      assert.match(calls[0].content, /failed: workflow aborted/i);
+    } finally {
+      rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const lateError of [
+    new WorkflowError("late quota exhausted", WorkflowErrorCode.PROVIDER_USAGE_LIMIT, {
+      recoverable: false,
+      resetHint: "Resets in 1m",
+    }),
+    new WorkflowError("late fatal failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false }),
+    new WorkflowError("late timeout", WorkflowErrorCode.AGENT_TIMEOUT, { recoverable: true }),
+  ]) {
+    it(`keeps an external abort terminal when a non-cooperative agent later returns ${lateError.code}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-external-before-${lateError.code}-`));
+      const agent = lateErrorAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      const external = new AbortController();
+      const errors: Array<{ error?: WorkflowError }> = [];
+      manager.on("error", (event) => errors.push(event));
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(lifecycleScript, undefined, {
+          externalSignal: external.signal,
+        });
+        await agent.waitForStart();
+        external.abort();
+        agent.rejectWith(lateError);
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        assert.equal(manager.getRun(runId)?.status, "aborted");
+        assert.equal(manager.getPersistence().load(runId)?.pauseReason, undefined);
+        assert.equal(errors.length, 1);
+        assert.equal(errors[0]?.error?.code, WorkflowErrorCode.WORKFLOW_ABORTED);
+        const calls = piCalls(pi);
+        assert.equal(calls.length, 1);
+        assert.equal(calls[0].triggerTurn, true);
+        assert.match(calls[0].content, /failed: workflow aborted/i);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const action of ["pause", "stop"] as const) {
+    it(`does not let a late ${action} hide a run-fatal error while a sibling drains`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-fatal-${action}-`));
+      const agent = fatalThenDrainAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      const errors: Array<{ error?: WorkflowError }> = [];
+      manager.on("error", (event) => errors.push(event));
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(fatalControlRaceScript);
+        await agent.waitForSiblingAbort();
+        assert.equal(manager[action](runId), true, `late ${action} request is accepted while the sibling drains`);
+
+        agent.settleSibling();
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        assert.equal(manager.getRun(runId)?.status, "failed", "the earlier run-fatal error wins the lifecycle state");
+        assert.equal(errors.length, 1, "the earlier run-fatal error remains observable");
+        assert.equal(errors[0]?.error?.code, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+        const calls = piCalls(pi);
+        assert.equal(calls.length, 1, "the real failure is delivered to the originating conversation");
+        assert.equal(calls[0].triggerTurn, true);
+        assert.match(calls[0].content, /fatal sibling failure/);
+      } finally {
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const action of ["pause", "stop"] as const) {
+    it(`keeps an earlier usage-limit checkpoint through a late ${action}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-usage-before-${action}-`));
+      const agent = usageLimitThenDrainAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      const errors: unknown[] = [];
+      let arms = 0;
+      const scheduler = new UsageLimitScheduler(manager, {
+        setTimer: () => {
+          arms++;
+          return {};
+        },
+        clearTimer: () => {},
+      });
+      manager.on("error", (event) => errors.push(event));
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(usageLimitControlRaceScript);
+        await agent.waitForSiblingAbort();
+        assert.equal(manager[action](runId), true, `late ${action} is accepted while the sibling drains`);
+
+        agent.settleSibling();
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        assert.equal(manager.getRun(runId)?.status, "paused", "the earlier quota checkpoint wins the final state");
+        assert.equal(errors.length, 0, "a usage limit is not delivered as a generic error");
+        const persisted = manager.getPersistence().load(runId);
+        assert.equal(persisted?.pauseReason, "usage_limit");
+        assert.equal(persisted?.resetHint, "Resets in 1m");
+        assert.equal(arms, 1, "the usage-limit scheduler is armed after the final pause");
+        const calls = piCalls(pi);
+        assert.equal(calls.length, 1, "the quota checkpoint is delivered once");
+        assert.equal(calls[0].triggerTurn, true);
+        assert.match(calls[0].content, /paused.*Resets in 1m/i);
+      } finally {
+        scheduler.dispose();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const action of ["pause", "stop"] as const) {
+    it(`does not let a late usage-limit result revive an earlier ${action}`, async () => {
+      const cwd = mkdtempSync(join(tmpdir(), `pi-dw-${action}-before-usage-`));
+      const agent = lateUsageLimitAgent();
+      const manager = new WorkflowManager({ cwd, agent: agent.runner });
+      const pi = createMockPi();
+      let arms = 0;
+      const scheduler = new UsageLimitScheduler(manager, {
+        setTimer: () => {
+          arms++;
+          return {};
+        },
+        clearTimer: () => {},
+      });
+
+      try {
+        mod.installResultDelivery(pi, manager);
+        manager.setSessionId(SESSION);
+        mod.bindSessionDelivery(SESSION, pi, { manager, stableSend: recordingStableSend(pi) });
+
+        const { runId, promise } = manager.startInBackground(lifecycleScript);
+        await agent.waitForStart();
+        assert.equal(manager[action](runId), true);
+
+        agent.rejectWithUsageLimit();
+        await promise.catch(() => {});
+        await Promise.resolve();
+
+        const expectedStatus = action === "pause" ? "paused" : "aborted";
+        assert.equal(manager.getRun(runId)?.status, expectedStatus);
+        assert.equal(manager.getPersistence().load(runId)?.pauseReason, undefined);
+        assert.equal(arms, 0, "a late quota result after user control must not arm auto-resume");
+        assert.equal(piCalls(pi).length, 0, "a late quota result after user control must not trigger a turn");
+      } finally {
+        scheduler.dispose();
+        rmSync(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
   it("skips usage-limit pause delivery for foreground runs", () => {
     const pi = createMockPi();
     const manager = createMockManager(makeRun({ background: false }));
@@ -753,7 +2130,7 @@ describe("installResultDelivery", () => {
     assert.ok(calls[0].content.includes("All tests passed"));
   });
 
-  it("parallel sessions: last bindCore must not steal the other session's send", () => {
+  it("parallel sessions: last bindCore must not steal the other session's send", async () => {
     const piA = createMockPi();
     const piB = createMockPi();
     const managerA = createMockManager(makeRun({ sessionId: "sess-A", runId: "run-A" }));
@@ -767,46 +2144,365 @@ describe("installResultDelivery", () => {
     managerA.setSessionId("sess-A");
     managerB.setSessionId("sess-B");
 
-    // Two host-shaped bindCores, B last — steal map must stay per-session.
-    invokePatchedBindCore({
+    // Two host-shaped sessions, B last — steal map must stay per-session.
+    // Seams (mirroring the source patch) now drive the *capture* arm, not the
+    // dead bindCore hook: invoke the patched sendCustomMessage on each fake
+    // session; the wrapper's host filter decides what (if anything) is stolen.
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "sess-A",
         getSessionName: () => "host-A",
+        isPersisted: () => true,
       },
       _resourceLoader: { noExtensions: false },
       sendCustomMessage: recordingStableSend(piA),
     });
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "sess-B",
         getSessionName: () => "host-B",
+        isPersisted: () => true,
       },
       _resourceLoader: { noExtensions: false },
       sendCustomMessage: recordingStableSend(piB),
     });
+    assert.ok(mod._getStealMapForTests().has("sess-A"), "fixture captures A host send");
+    assert.ok(mod._getStealMapForTests().has("sess-B"), "fixture captures B host send");
 
     mod.installResultDelivery(piA as unknown as ExtensionAPI, managerA);
     // No stableSend — same as production session_start.
     mod.bindSessionDelivery("sess-A", piA as unknown as ExtensionAPI, { manager: managerA });
     mod.installResultDelivery(piB as unknown as ExtensionAPI, managerB);
     mod.bindSessionDelivery("sess-B", piB as unknown as ExtensionAPI, { manager: managerB });
+    assert.equal(mod._getSessionDeliveryEndpointForTests("sess-A")?.hasSend, true);
+    assert.equal(mod._getSessionDeliveryEndpointForTests("sess-B")?.hasSend, true);
 
     managerA.emit("complete", { runId: "run-A" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
 
     assert.equal(piCalls(piA).length, 1, "origin A receives");
     assert.equal(piCalls(piB).length, 0, "sibling B must not receive A's result");
     assert.ok(piCalls(piA)[0].content.includes("All tests passed"));
 
     managerB.emit("complete", { runId: "run-B" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
     assert.equal(piCalls(piA).length, 1, "A must not receive B's result");
     assert.equal(piCalls(piB).length, 1, "origin B receives its own result");
     assert.ok(piCalls(piB)[0].content.includes("from-B"));
   });
 
+  it("steal accepts an isSessionOnDisk-only host (omp session shape)", async () => {
+    // omp's SessionManager has neither isPersisted() nor a `persist` field —
+    // only isSessionOnDisk(). Without this branch the host is never stolen and
+    // completion stays pendingDelivery forever (#109).
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-omp",
+        runId: "run-omp",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    manager.setSessionId("sess-omp");
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        getSessionId: () => "sess-omp",
+        getSessionName: () => "host-omp",
+        isSessionOnDisk: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    mod.bindSessionDelivery("sess-omp", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-omp" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(piCalls(pi).length, 1, "omp-shaped host receives its result");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+    const stealKeys = () => [...mod._getStealMapForTests().keys()];
+    assert.ok(stealKeys().includes("sess-omp"), "omp-shaped host is stolen");
+  });
+
+  it("quiet host: bind probes once via pi.sendMessage, captures send, delivers", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-quiet",
+        runId: "run-quiet",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    // Emulate the real host wiring: the void extension wrapper synchronously
+    // routes through AgentSession.sendCustomMessage, where the prototype patch
+    // captures the live session.
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage({
+        sessionManager: {
+          getSessionId: () => "sess-quiet",
+          getSessionName: () => "host-quiet",
+          isSessionOnDisk: () => true,
+        },
+        _resourceLoader: { noExtensions: false },
+        sendCustomMessage: recordingStableSend(pi),
+      });
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-quiet");
+    mod.bindSessionDelivery("sess-quiet", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-quiet" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(probeCalls, 1, "exactly one probe per session");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after probe capture");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+  });
+
+  it("omp print-mode host: probe captures despite isSessionOnDisk false at session_start", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-omp",
+        runId: "run-omp",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-omp",
+            getSessionName: () => "host-omp",
+            // omp persists lazily AFTER bind — the on-disk gate must not
+            // reject a probe-bearing send (root cause of the E2E failure).
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-omp");
+    mod.bindSessionDelivery("sess-omp", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-omp" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(probeCalls, 1, "probe attempted");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after probe capture");
+    assert.ok(piCalls(pi)[0].content.includes("delivered"));
+  });
+
+  it("probe bypass never captures workflow: child sessions", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-child", runId: "run-child" }));
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-child",
+            getSessionName: () => "workflow:run-child",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-child");
+    mod.bindSessionDelivery("sess-child", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-child" });
+
+    assert.equal(piCalls(pi).length, 0, "child session probe is rejected by the name gate");
+  });
+
+  it("probe failure keeps bind fail-closed with pending on disk", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-throws", runId: "run-throws" }));
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+      throw new Error("Extension runtime not initialized.");
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-throws");
+    mod.bindSessionDelivery("sess-throws", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-throws" });
+
+    assert.equal(probeCalls, 1, "probe attempted");
+    assert.equal(piCalls(pi).length, 0, "no delivery without a captured send");
+    assert.ok(manager.getPersistence?.().load("run-throws")?.pendingDelivery, "pending stays on disk");
+  });
+
+  it("no probe when the steal map already holds the send", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(
+      makeRun({
+        sessionId: "sess-map",
+        runId: "run-map",
+        result: { result: { verdict: "delivered" }, agentCount: 1, durationMs: 1 },
+      }),
+    );
+    let probeCalls = 0;
+    (pi as unknown as { sendMessage: (m: unknown, o: unknown) => void }).sendMessage = () => {
+      probeCalls++;
+    };
+
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        getSessionId: () => "sess-map",
+        getSessionName: () => "host-map",
+        isSessionOnDisk: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-map");
+    mod.bindSessionDelivery("sess-map", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-map" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    assert.equal(probeCalls, 0, "map hit skips the probe");
+    assert.equal(piCalls(pi).length, 1, "delivery uses the pre-captured send");
+  });
+
+  it("probe is capture-only: never forwarded to the session's sendCustomMessage", () => {
+    let spyCalls = 0;
+    const messages: unknown[] = ["pre-existing"];
+    invokePatchedSendCustomMessage(
+      {
+        agent: { state: { messages } },
+        sessionManager: {
+          getSessionId: () => "sess-probe-only",
+          getSessionName: () => "host-probe-only",
+          // probe-bearing sends bypass the persistence gate — omit isSessionOnDisk
+        },
+        _resourceLoader: { noExtensions: false },
+        sendCustomMessage: () => {
+          spyCalls++;
+          return Promise.resolve();
+        },
+      },
+      { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+    );
+
+    assert.equal(spyCalls, 0, "probe must never reach the host session's send");
+    assert.equal(messages.length, 1, "probe must never append to agent.state.messages");
+    assert.ok(mod._getStealMapForTests().has("sess-probe-only"), "capture happened despite the swallow");
+  });
+
+  it("failed probe is retried on the next bind (no pre-marked probed set)", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-retry", runId: "run-retry" }));
+    let sendMessageCalls = 0;
+    const throwingPi = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    throwingPi.sendMessage = () => {
+      sendMessageCalls++;
+      throw new Error("Extension runtime not initialized.");
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-retry");
+    mod.bindSessionDelivery("sess-retry", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-retry" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sendMessageCalls, 1);
+    assert.equal(piCalls(pi).length, 0, "first bind fail-closed");
+    assert.ok(manager.getPersistence?.().load("run-retry")?.pendingDelivery, "pending stays on disk");
+
+    // Second bind: a working pi whose probe routes through the capture patch.
+    const recoveringPi = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    recoveringPi.sendMessage = () => {
+      sendMessageCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-retry",
+            getSessionName: () => "host-retry",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+    mod.bindSessionDelivery("sess-retry", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "run-retry" });
+
+    assert.equal(sendMessageCalls, 2, "the failed probe was retried, not skipped");
+    assert.equal(piCalls(pi).length, 1, "delivery flows after the retried probe captures");
+    assert.equal(piCalls(pi)[0].triggerTurn, true);
+  });
+
+  it("dropSessionDelivery clears probed state: a new bind probes again", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun({ sessionId: "sess-dropped", runId: "run-dropped" }));
+    let probeCalls = 0;
+    const override = pi as unknown as { sendMessage: (m: unknown, o: unknown) => void };
+    override.sendMessage = () => {
+      probeCalls++;
+      invokePatchedSendCustomMessage(
+        {
+          sessionManager: {
+            getSessionId: () => "sess-dropped",
+            getSessionName: () => "host-dropped",
+            isSessionOnDisk: () => false,
+          },
+          _resourceLoader: { noExtensions: false },
+          sendCustomMessage: recordingStableSend(pi),
+        },
+        { customType: mod.DELIVERY_PROBE_CUSTOM_TYPE, content: "", display: false },
+      );
+    };
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("sess-dropped");
+    mod.bindSessionDelivery("sess-dropped", pi as unknown as ExtensionAPI, { manager });
+    assert.equal(probeCalls, 1, "first bind probes");
+    assert.equal(mod._isProbedForTests("sess-dropped"), true, "successful probe marks the session");
+
+    mod.dropSessionDelivery("sess-dropped");
+    assert.equal(mod._isProbedForTests("sess-dropped"), false, "drop forgets the probe mark");
+    mod.bindSessionDelivery("sess-dropped", pi as unknown as ExtensionAPI, { manager });
+    assert.equal(probeCalls, 2, "post-drop bind probes again");
+  });
+
+  it("bindCore capture path captures a persisted host without any probe", () => {
+    const pi = createMockPi();
+    invokePatchedBindExtensionCore({
+      sessionManager: {
+        getSessionId: () => "sess-bindcore",
+        getSessionName: () => "host-bindcore",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+
+    assert.ok(mod._getStealMapForTests().has("sess-bindcore"), "bindCore captured the send");
+    assert.equal(
+      (pi as unknown as { _calls: DeliveryCall[] })._calls.length,
+      0,
+      "no probe needed: capture happened at bindCore",
+    );
+  });
+
   it("steal map pins only the host session; drop releases the host closure", () => {
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: false,
         getSessionId: () => "child-mem",
@@ -814,7 +2510,7 @@ describe("installResultDelivery", () => {
       },
       sendCustomMessage: async () => {},
     });
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "child-noext",
@@ -823,7 +2519,7 @@ describe("installResultDelivery", () => {
       _resourceLoader: { noExtensions: true },
       sendCustomMessage: async () => {},
     });
-    invokePatchedBindCore({
+    invokePatchedSendCustomMessage({
       sessionManager: {
         persist: true,
         getSessionId: () => "child-named",
@@ -831,23 +2527,295 @@ describe("installResultDelivery", () => {
       },
       sendCustomMessage: async () => {},
     });
-    invokePatchedBindCore({
-      sessionManager: {
-        persist: true,
-        getSessionId: () => "host-1",
-        getSessionName: () => "chat",
-      },
-      _resourceLoader: { noExtensions: false },
-      sendCustomMessage: async () => {},
-    });
+    const hostSend: StableSend = async () => {};
+    mod._registerBoundSessionSendForTests("host-1", hostSend);
 
-    assert.equal(mod._hasBoundSessionSendForTests("child-mem"), false, "in-memory child must not pin");
-    assert.equal(mod._hasBoundSessionSendForTests("child-noext"), false, "noExtensions child must not pin");
-    assert.equal(mod._hasBoundSessionSendForTests("child-named"), false, "workflow: child must not pin");
-    assert.equal(mod._hasBoundSessionSendForTests("host-1"), true, "host session is stolen");
+    const stealKeys = () => [...mod._getStealMapForTests().keys()];
+    assert.ok(!stealKeys().includes("child-mem"), "in-memory child must not pin");
+    assert.ok(!stealKeys().includes("child-noext"), "noExtensions child must not pin");
+    assert.ok(!stealKeys().includes("child-named"), "workflow: child must not pin");
+    assert.ok(stealKeys().includes("host-1"), "host session is stolen");
+    // The captured value must be the EXACT send the host registered — the steal
+    // map holds the session-stable original, never a wrapper or a stale copy
+    // from an earlier session (T5).
+    assert.equal(mod._getStealMapForTests().get("host-1"), hostSend, "steal map holds the exact original send");
 
     mod.dropSessionDelivery("host-1");
-    assert.equal(mod._hasBoundSessionSendForTests("host-1"), false, "drop releases the host send closure");
+    assert.ok(!stealKeys().includes("host-1"), "drop releases the host send closure");
+    assert.equal(mod._getStealMapForTests().get("host-1"), undefined, "drop clears the map entry entirely");
+    assert.equal(mod._getSessionDeliveryEndpointForTests("host-1"), undefined, "drop clears the endpoint too");
+  });
+
+  it("live sendCustomMessage capture: host session send is used for delivery end to end", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // Production capture path: a live host AgentSession's sendCustomMessage is
+    // wrapped by the patch, so invoking it steals the session-stable send.
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+
+    assert.ok(mod._getStealMapForTests().has(SESSION), "host send captured into steal map");
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    // Production session_start: steal map is the only send source.
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    const calls = piCalls(pi);
+    assert.equal(calls.length, 1, "captured send delivers the result");
+    assert.equal(calls[0].triggerTurn, true, "captured send must triggerTurn");
+    assert.ok(calls[0].content.includes("All tests passed"));
+  });
+
+  it("captured host send receives the exact production payload (T1)", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const exact: ExactSendCall[] = [];
+
+    // A live host AgentSession send is captured; the delivery path must invoke
+    // the captured send with EXACTLY the arguments tryDeliverEndpoint sends:
+    // {customType:"workflow-result", content, display:true} and
+    // {triggerTurn:true, deliverAs:"followUp"}.
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: recordingSendExact(exact),
+    });
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    await Promise.resolve();
+    await Promise.resolve();
+
+    assert.equal(exact.length, 1, "captured host send is invoked exactly once");
+    assert.equal(exact[0].message.customType, "workflow-result");
+    assert.equal(exact[0].message.display, true);
+    assert.ok(exact[0].message.content?.includes("All tests passed"), "content is the delivered result text");
+    assert.equal(exact[0].options?.triggerTurn, true, "delivery must triggerTurn");
+    assert.equal(exact[0].options?.deliverAs, "followUp", "delivery must be queued as followUp");
+    // ACK cleared the pending marker.
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(
+      manager.getPersistence?.().load("test-run-1")?.pendingDelivery,
+      undefined,
+      "cleared after thenable ACK",
+    );
+  });
+
+  it("triggerTurn non-streaming routes through _runAgentPrompt (T4)", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const prompted: unknown[] = [];
+    const settled: string[] = [];
+    const history = createPersistedDeliveryHistory();
+
+    // An IDLE host session: isStreaming=false, so the real sendCustomMessage
+    // with triggerTurn:true takes the _runAgentPrompt branch — the branch real
+    // host deliveries actually hit. The fake supplies the internals that path
+    // touches; agent.prompt is a stub so no real LLM call is made.
+    const idleSession = Object.create(AgentSession.prototype) as object & {
+      agent: unknown;
+      sessionManager: unknown;
+      _resourceLoader: unknown;
+      _isAgentRunActive: boolean;
+      _pendingBashMessages: unknown[];
+      _pendingNextTurnMessages: unknown[];
+      _pendingCustomMessages: unknown[];
+      _extensionRunner: unknown;
+      _emit: () => void;
+    };
+    idleSession.agent = {
+      state: { messages: [] },
+      prompt: async (messages: unknown) => {
+        prompted.push(messages);
+        const message = messages as { customType?: string; details?: unknown };
+        if (message.customType === "workflow-result") {
+          history.append({
+            id: `entry-${history.branch.length}`,
+            type: "custom_message",
+            customType: message.customType,
+            details: message.details,
+          });
+        }
+        return { stopReason: "end_turn" };
+      },
+      continue: async () => {},
+    };
+    idleSession.sessionManager = {
+      persist: true,
+      getSessionId: () => SESSION,
+      getSessionName: () => "chat",
+      isPersisted: () => true,
+      getBranch: () => history.branch,
+      getSessionFile: () => history.sessionFile,
+      appendCustomMessageEntry: (customType: string, _content: unknown, _display: boolean, details?: unknown) => {
+        history.append({ id: `entry-${history.branch.length}`, type: "custom_message", customType, details });
+        return "";
+      },
+    };
+    idleSession._resourceLoader = { noExtensions: false };
+    idleSession._isAgentRunActive = false;
+    idleSession._pendingBashMessages = [];
+    idleSession._pendingNextTurnMessages = [];
+    idleSession._pendingCustomMessages = [];
+    Object.assign(idleSession, { subscribe: () => () => {} });
+    idleSession._extensionRunner = {
+      emit: async (e: { type: string }) => {
+        settled.push(e.type);
+      },
+    };
+    idleSession._emit = () => {};
+    mod._registerHostSessionForTests(idleSession as never);
+
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    // The thenable ACK resolves only after _runAgentPrompt settles.
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    assert.equal(prompted.length, 1, "triggerTurn delivery must start an agent prompt");
+    const appMessage = prompted[0] as { customType?: string; content?: unknown; display?: boolean };
+    assert.equal(appMessage.customType, "workflow-result", "the prompt receives the delivered app message");
+    assert.equal(appMessage.display, true);
+    assert.ok(settled.includes("agent_settled"), "the run settles after the prompt");
+    assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after prompt ACK");
+  });
+
+  it("child session sendCustomMessage is not captured and never delivers", () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // A workflow child (in-memory SessionManager) invoking sendCustomMessage
+    // must not be pinned — it is not the host session.
+    invokePatchedSendCustomMessage({
+      sessionManager: {
+        persist: false,
+        getSessionId: () => "child-mem",
+        getSessionName: () => "",
+      },
+      sendCustomMessage: recordingStableSend(pi),
+    });
+    assert.ok(!mod._getStealMapForTests().has("child-mem"), "child must not be stolen");
+
+    // Even if the child's id were somehow bound, a delivery routed to it has no
+    // host endpoint — fail closed, nothing sent, marker stays pending.
+    mod._registerBoundSessionSendForTests("child-mem", recordingStableSend(pi));
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId("child-mem");
+    mod.bindSessionDelivery("child-mem", pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    assert.equal(piCalls(pi).length, 0, "child send must never be used for delivery");
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays for a real host bind");
+  });
+
+  it("non-thenable captured send fails closed: pending stays (no false ACK)", async () => {
+    const pi = createMockPi();
+    const manager = createMockManager(makeRun());
+    const history = createPersistedDeliveryHistory();
+
+    // A captured host send that does not return a thenable (fire-and-forget)
+    // must not be trusted as an ACK — content stays pending on disk.
+    const nonThenable = () => {
+      pi._calls.push({ content: "fired", customType: "workflow-result" });
+      return undefined;
+    };
+    mod._registerHostSessionForTests({
+      isStreaming: false,
+      isIdle: true,
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+        getBranch: () => history.branch,
+        getSessionFile: () => history.sessionFile,
+      },
+      subscribe: () => () => {},
+      _resourceLoader: { noExtensions: false },
+      // The delivery path invokes the captured host send with a real host
+      // receiver (the fix forwards on the live session), so the stub needs the
+      // internals sendCustomMessage touches; the send itself is still the
+      // non-thenable function under test.
+      sendCustomMessage: captureStub(nonThenable),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+    await new Promise<void>((resolve) => setImmediate(resolve));
+
+    // The captured send IS attempted (through the live receiver), but because it
+    // returns no thenable it must not be trusted as an ACK — no triggerTurn, and
+    // the marker stays pending on disk.
+    assert.equal(piCalls(pi).length, 1, "captured non-thenable send is attempted");
+    assert.equal(piCalls(pi)[0].triggerTurn, undefined, "non-thenable send never ACKs (fail closed)");
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays (fail closed)");
+  });
+
+  it("failed captured send leaves pending; next bind flushes", async () => {
+    const pi = createMockPi();
+    const freshPi = createMockPi();
+    const manager = createMockManager(makeRun());
+
+    // A captured host send that returns a rejecting thenable: no ACK, marker
+    // stays pending until a healthy generation binds and flushes. The captured
+    // send runs with a real host receiver (fix: forward on the live session),
+    // so the stub supplies the internals sendCustomMessage touches.
+    const failingSend = () => Promise.reject(new Error("network blip"));
+    mod._registerHostSessionForTests({
+      sessionManager: {
+        persist: true,
+        getSessionId: () => SESSION,
+        getSessionName: () => "chat",
+        isPersisted: () => true,
+      },
+      _resourceLoader: { noExtensions: false },
+      sendCustomMessage: captureStub(failingSend),
+    });
+    mod.installResultDelivery(pi as unknown as ExtensionAPI, manager);
+    manager.setSessionId(SESSION);
+    mod.bindSessionDelivery(SESSION, pi as unknown as ExtensionAPI, { manager });
+    manager.emit("complete", { runId: "test-run-1" });
+
+    // Let the failing send settle (reject + in-flight release) before rebinding,
+    // so the next generation's flush picks the run up cleanly.
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.ok(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, "pending stays after failed send");
+
+    // Rebind with a healthy send: flush retries the delivery and clears pending.
+    mod.bindSessionDelivery(SESSION, freshPi as unknown as ExtensionAPI, {
+      manager,
+      stableSend: recordingStableSend(freshPi),
+    });
+    const calls = piCalls(freshPi);
+    assert.equal(calls.length, 1, "healthy generation flushes the pending delivery");
+    assert.ok(calls[0].content.includes("All tests passed"));
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.equal(manager.getPersistence?.().load("test-run-1")?.pendingDelivery, undefined, "cleared after ACK");
   });
 
   it("append-only is not an ACK; pending stays until a thenable send exists", () => {
@@ -1047,6 +3015,42 @@ describe("installTaskPanel", () => {
     assert.equal(registeredPlacement, "belowEditor");
   });
 
+  it("repaints on agentModel, so a running agent's corrected model reaches the panel", () => {
+    // The manager corrects agent.model IN PLACE on the live snapshot, so without a
+    // repaint subscription the panel keeps showing the pre-resolution model until
+    // some unrelated event happens to fire.
+    const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
+      getRun: (...args: unknown[]) => unknown;
+      listRuns: () => unknown[];
+    };
+    manager.getRun = () => undefined;
+    manager.listRuns = () => [];
+
+    let factory: ((tui: { requestRender(): void }, theme: unknown) => { dispose?(): void }) | undefined;
+    const ui = {
+      setWidget: (_name: string, registeredFactory: typeof factory) => {
+        factory = registeredFactory;
+      },
+    };
+
+    mod.installTaskPanel(null, manager, ui);
+    let renders = 0;
+    const component = factory?.(
+      { requestRender: () => renders++ },
+      {
+        fg: (_c: string, t: string) => t,
+        bold: (t: string) => t,
+      },
+    );
+
+    manager.emit("agentModel", { runId: "a", agentId: 1, id: "a:0", label: "x", model: "prov/real-model" });
+    assert.equal(renders, 1, "agentModel must be in RUN_EVENTS");
+
+    component?.dispose?.();
+    manager.emit("agentModel", { runId: "a", agentId: 1, id: "a:0", label: "x", model: "prov/real-model" });
+    assert.equal(renders, 1, "dispose must unsubscribe it again (symmetric with RUN_EVENTS)");
+  });
+
   it("passes the render width through to the task panel", () => {
     const manager = new EventEmitter() as ReturnType<typeof EventEmitter> & {
       getRun: (...args: unknown[]) => unknown;
@@ -1118,6 +3122,44 @@ describe("renderPanel", () => {
       getRun: () => undefined,
     };
     assert.deepEqual(renderPanel(manager as never, theme as never), []);
+  });
+
+  it("renders each pending delivery row with its actual terminal status", async () => {
+    const { renderPanel } = await import("../src/task-panel.js");
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "p",
+          workflowName: "pending-completed",
+          status: "completed",
+          pendingDelivery: { kind: "complete" },
+          agents: [],
+          logs: [],
+        },
+        {
+          runId: "f",
+          workflowName: "pending-failed",
+          status: "failed",
+          pendingDelivery: { kind: "error" },
+          agents: [],
+          logs: [],
+        },
+        {
+          runId: "a",
+          workflowName: "pending-aborted",
+          status: "aborted",
+          pendingDelivery: { kind: "text" },
+          agents: [],
+          logs: [],
+        },
+      ],
+      getRun: () => undefined,
+    };
+    const lines = renderPanel(manager as never, theme as never);
+    assert.ok(lines.some((l) => l.includes("completed, result delivery pending")));
+    assert.ok(lines.some((l) => l.includes("failed, result delivery pending")));
+    assert.ok(lines.some((l) => l.includes("aborted, result delivery pending")));
+    assert.ok(lines.some((l) => l.includes("Workflows pending delivery (3):")));
   });
 
   it("truncates every rendered line to the requested visible width", async () => {
@@ -1203,7 +3245,7 @@ describe("renderPanelDetailed", () => {
   // `blueTokens` drives the first agent's live token count; the run aggregate and
   // token/s are summed from per-agent tokens (the run-level tokenUsage aggregate is
   // not live — see renderPanelDetailed), so growing blueTokens grows the rate.
-  function detailedManager(blueTokens: number, status = "running") {
+  function detailedManager(blueTokens: number, status = "running", estimated = false) {
     const snapshot = {
       name: "auth_audit",
       phases: ["Scan", "Review"],
@@ -1216,6 +3258,19 @@ describe("renderPanelDetailed", () => {
           status: "done",
           phase: "Scan",
           tokens: blueTokens,
+          ...(estimated
+            ? {
+                tokenUsage: {
+                  input: 0,
+                  output: blueTokens,
+                  total: blueTokens,
+                  cacheRead: 0,
+                  cacheWrite: 0,
+                  cost: 0,
+                  estimated: true,
+                },
+              }
+            : {}),
           model: "anthropic/claude-haiku-4-5",
         },
         { id: 2, label: "audit_auth", status: "running", phase: "Scan", tokens: 1800 },
@@ -1366,6 +3421,49 @@ describe("renderPanelDetailed", () => {
     );
   });
 
+  it("keeps token-rate estimate provenance for its rolling-window endpoints", async () => {
+    const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
+
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(2100, "running", true) as never, theme as never, undefined, 8, 1000);
+    let lines = renderPanelDetailed(
+      detailedManager(4100, "running", true) as never,
+      theme as never,
+      undefined,
+      8,
+      2000,
+    );
+    assert.ok(
+      lines.some((line) => /~2000 tok\/s/.test(line)),
+      "estimated → estimated rate is marked",
+    );
+
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(2100, "running", true) as never, theme as never, undefined, 8, 1000);
+    lines = renderPanelDetailed(detailedManager(4100) as never, theme as never, undefined, 8, 2000);
+    assert.ok(
+      lines.some((line) => /~2000 tok\/s/.test(line)),
+      "estimated → exact rate remains marked",
+    );
+
+    // The initial estimated endpoint ages out, leaving two exact endpoints for
+    // the rate. The marker must then clear rather than sticking to the run.
+    lines = renderPanelDetailed(detailedManager(6100) as never, theme as never, undefined, 8, 12001);
+    assert.ok(
+      lines.some((line) => /200 tok\/s/.test(line)),
+      "two exact endpoints still render a rate",
+    );
+    assert.ok(!lines.some((line) => /~\d+ tok\/s/.test(line)), "two exact endpoints clear the estimate marker");
+
+    // A duplicate render can correct its provenance without changing either
+    // timestamp or total; retain one sample, but replace its marker.
+    clearTokenSamples("r1");
+    renderPanelDetailed(detailedManager(2100, "running", true) as never, theme as never, undefined, 8, 1000);
+    renderPanelDetailed(detailedManager(2100) as never, theme as never, undefined, 8, 1000);
+    lines = renderPanelDetailed(detailedManager(4100) as never, theme as never, undefined, 8, 2000);
+    assert.ok(!lines.some((line) => /~\d+ tok\/s/.test(line)), "same-timestamp correction updates the endpoint marker");
+  });
+
   it("caps agents per phase and reports the overflow", async () => {
     const { renderPanelDetailed, clearTokenSamples } = await import("../src/task-panel.js");
     clearTokenSamples("r1");
@@ -1383,6 +3481,43 @@ describe("renderPanelDetailed", () => {
     renderPanelDetailed(detailedManager(1000, "paused") as never, theme as never, undefined, 8, 1000);
     const lines = renderPanelDetailed(detailedManager(3000, "paused") as never, theme as never, undefined, 8, 2000);
     assert.ok(!lines.some((l) => /tok\/s/.test(l)), "paused run shows no token rate");
+  });
+
+  it("renders actual terminal statuses for pending delivery rows in detailed mode", async () => {
+    const { renderPanelDetailed } = await import("../src/task-panel.js");
+    const manager = {
+      listRuns: () => [
+        {
+          runId: "p",
+          workflowName: "pending-completed",
+          status: "completed",
+          pendingDelivery: { kind: "complete" },
+          agents: [],
+          logs: [],
+        },
+        {
+          runId: "f",
+          workflowName: "pending-failed",
+          status: "failed",
+          pendingDelivery: { kind: "error" },
+          agents: [],
+          logs: [],
+        },
+        {
+          runId: "a",
+          workflowName: "pending-aborted",
+          status: "aborted",
+          pendingDelivery: { kind: "text" },
+          agents: [],
+          logs: [],
+        },
+      ],
+      getRun: () => undefined,
+    };
+    const lines = renderPanelDetailed(manager as never, theme as never, undefined, 8, 1000);
+    assert.ok(lines.some((l) => l.includes("completed, result delivery pending")));
+    assert.ok(lines.some((l) => l.includes("failed, result delivery pending")));
+    assert.ok(lines.some((l) => l.includes("aborted, result delivery pending")));
   });
 });
 
@@ -1509,4 +3644,93 @@ describe("deliverText", () => {
     const over = deliverText(makeResult({ note: "y".repeat(390) }) as never);
     assert.ok(/…\(truncated/.test(over), "a 406-char dump exceeds the default 400");
   });
+});
+
+it("sessionFileContainsEntry finds entries before AND after the incremental scan offset (audit2 #29)", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-"));
+  const file = join(dir, "session.jsonl");
+  const entry1 = { id: "e1", type: "custom_message", customType: "workflow-result", details: { deliveryId: "d1" } };
+  const entry2 = { id: "e2", type: "custom_message", customType: "workflow-result", details: { deliveryId: "d2" } };
+  // A header line first: the needle carries a leading \n, so a first-line
+  // entry is unmatchable by design (production session files always have one).
+  writeFileSync(file, `${JSON.stringify({ id: "header" })}\n${JSON.stringify(entry1)}\n`);
+  // First scan caches the offset at EOF (miss for an absent needle is fine).
+  assert.equal(sessionFileContainsEntry(file, { id: "absent" }), false);
+  // New content appended AFTER the cached offset: found via the tail scan.
+  appendFileSync(file, `${JSON.stringify(entry2)}\n`);
+  assert.equal(sessionFileContainsEntry(file, entry2), true, "appended entry found from the resumed offset");
+  // Content written BEFORE the cached offset (interleaved delivery): head fallback.
+  assert.equal(sessionFileContainsEntry(file, entry1), true, "pre-offset entry found via the head fallback");
+  assert.equal(sessionFileContainsEntry(file, { id: "never" }), false);
+  // REPEAT the same needle with nothing appended (the delivery-ACK poll
+  // loop). NOTE: this pins CORRECTNESS only — the head fallback masks the
+  // off-by-one cost regression (r1 M1) at the boolean level; the tail-window
+  // sizing was verified by read-count probe in review.
+  assert.equal(sessionFileContainsEntry(file, entry2), true, "repeat check of the last entry still finds it");
+});
+
+it("sessionFileContainsEntry finds a needle that crosses the 64 KiB scan boundary", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-boundary-"));
+  const file = join(dir, "session.jsonl");
+  const entry = { id: "boundary", type: "custom_message", customType: "workflow-result" };
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  const boundary = 64 * 1024;
+  const prefixLength = boundary - 2 - Buffer.byteLength(header) - 1;
+  assert.ok(prefixLength > 0);
+  writeFileSync(file, `${header}${"x".repeat(prefixLength)}\n${JSON.stringify(entry)}\n`);
+
+  assert.equal(sessionFileContainsEntry(file, entry), true, "the record starts just before the 64 KiB boundary");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it("sessionFileContainsEntry rescans from the head after a cached file offset becomes stale on truncate", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-truncate-"));
+  const file = join(dir, "session.jsonl");
+  const entry = { id: "kept-after-truncate", type: "custom_message", customType: "workflow-result" };
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  const retained = `${header}${JSON.stringify(entry)}\n`;
+  writeFileSync(file, `${retained}${"z".repeat(70 * 1024)}\n`);
+
+  assert.equal(sessionFileContainsEntry(file, { id: "absent" }), false, "cache the original larger offset");
+  truncateSync(file, Buffer.byteLength(retained));
+  assert.equal(sessionFileContainsEntry(file, entry), true, "the retained record remains discoverable after shrink");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it("sessionFileContainsEntry invalidates a same-path rename replacement", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-rename-"));
+  const file = join(dir, "session.jsonl");
+  const replacement = join(dir, "session.replacement.jsonl");
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  const oldEntry = { id: "old-record", type: "custom_message", customType: "workflow-result" };
+  const newEntry = { id: "new-record", type: "custom_message", customType: "workflow-result" };
+  writeFileSync(file, `${header}${JSON.stringify(oldEntry)}\n`);
+  assert.equal(sessionFileContainsEntry(file, oldEntry), true);
+
+  writeFileSync(replacement, `${header}${JSON.stringify(newEntry)}\n`);
+  renameSync(replacement, file);
+  assert.equal(sessionFileContainsEntry(file, newEntry), true, "the replacement file's record is found");
+  assert.equal(sessionFileContainsEntry(file, oldEntry), false, "the old file's record is not retained by the cache");
+  rmSync(dir, { recursive: true, force: true });
+});
+
+it("sessionFileContainsEntry requires the complete record and rejects other substrings", async () => {
+  const { sessionFileContainsEntry } = await import("../src/task-panel.js");
+  const dir = mkdtempSync(join(tmpdir(), "pdw-scan-record-"));
+  const file = join(dir, "session.jsonl");
+  const entry = { id: "duplicate-record", type: "custom_message", customType: "workflow-result" };
+  const header = `${JSON.stringify({ type: "session", cwd: dir })}\n`;
+  writeFileSync(file, `${header}${JSON.stringify(entry)}\n${JSON.stringify(entry)}\n`);
+
+  assert.equal(sessionFileContainsEntry(file, entry), true, "a duplicated complete record matches");
+  assert.equal(
+    sessionFileContainsEntry(file, { id: "duplicate", type: "custom_message", customType: "workflow-result" }),
+    false,
+    "a similar substring is not treated as the full record",
+  );
+  rmSync(dir, { recursive: true, force: true });
 });

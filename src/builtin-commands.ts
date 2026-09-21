@@ -15,6 +15,8 @@ import type { ExtensionAPI, ExtensionCommandContext, ToolDefinition } from "@ear
 import type { BuiltinWorkflowInvocation } from "./builtin-workflows.js";
 import { findBuiltinWorkflow } from "./builtin-workflows.js";
 import { MAX_DIFF_CHARS } from "./code-review.js";
+import { claimCommand, isCommandRegistered } from "./command-registry.js";
+import { backgroundStartNotice } from "./display.js";
 import { parseCommandArgs } from "./saved-commands.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 import { createWorkflowStorage, type WorkflowStorage } from "./workflow-saved.js";
@@ -259,11 +261,7 @@ function shortError(error: unknown): string {
 }
 
 function alreadyRegistered(pi: ExtensionAPI, name: string): boolean {
-  try {
-    return (pi.getCommands?.() ?? []).some((c: { name: string }) => c.name === name);
-  } catch {
-    return false;
-  }
+  return isCommandRegistered(pi, name);
 }
 
 /** Split a command argument string into tokens, respecting single/double quotes. */
@@ -293,10 +291,7 @@ function startBackground(
 ): void {
   try {
     const { runId } = manager.startInBackground(script, args, exec ?? {});
-    ctx.ui.notify(
-      `/${name} running in the background (${runId}) — watch the task panel or /workflows; the report is posted here when it finishes.`,
-      "info",
-    );
+    ctx.ui.notify(backgroundStartNotice(name, runId, ctx.mode, "report"), "info");
   } catch (error) {
     ctx.ui.notify(`${name} failed to start: ${error instanceof Error ? error.message : error}`, "error");
   }
@@ -369,10 +364,48 @@ export function registerBuiltinWorkflows(
    * context) so a shadowed command behaves identically to how it would if the
    * saved workflow itself had been registered under this name.
    */
+  // Positional-argument contract of each shadowable builtin, mirroring how the
+  // builtin maps the raw argument string (audit2 #43). A saved shadow must
+  // honor the same contract, or every invocation runs with an empty/garbage
+  // primary arg. code-review is intentionally absent: its builtin `diff` comes
+  // from a git capture the shadow path cannot reproduce, so a code-review
+  // shadow keeps the standard parsed-args behavior.
+  const SHADOW_WHOLE_STRING_PRIMARY: Record<string, string> = {
+    "deep-research": "question",
+    "adversarial-review": "task",
+  };
+  const SHADOW_TOKENIZED_PRIMARY: Record<string, { primary: string; rest: string }> = {
+    "multi-perspective": { primary: "topic", rest: "perspectives" },
+    "codebase-audit": { primary: "scope", rest: "checks" },
+  };
+
   function runSavedShadowIfPresent(name: string, rawArgs: string, ctx: ExtensionCommandContext): boolean {
     const saved = getStorage().load(name);
     if (!saved) return false;
-    startBackground(getManager(), ctx, name, saved.script, parseCommandArgs(rawArgs, saved.parameters));
+    const parsed = parseCommandArgs(rawArgs, saved.parameters);
+    const raw = typeof parsed._raw === "string" ? parsed._raw.trim() : "";
+    // An explicit `key=value` for the primary beats the positional mapping;
+    // the user's bare positional beats a declared parameter default.
+    const wholeKey = SHADOW_WHOLE_STRING_PRIMARY[name];
+    if (wholeKey && !new RegExp(`(?:^|\\s)${wholeKey}=`).test(rawArgs) && raw) {
+      // The WHOLE raw string is the primary — exactly the builtin's
+      // args.trim(), including "="-containing topics (r2 NIT).
+      parsed[wholeKey] = raw;
+    }
+    const tokenized = SHADOW_TOKENIZED_PRIMARY[name];
+    if (tokenized && !new RegExp(`(?:^|\\s)${tokenized.primary}=`).test(rawArgs) && raw) {
+      // Quote-aware tokenization, mirroring the builtin handler's own
+      // tokenizer (r2 MINOR): /multi-perspective "auth flows" security →
+      // topic "auth flows", perspectives ["security"].
+      const tokens = tokenizeArgs(raw);
+      // A leading key=value token means a named-arg-style invocation —
+      // mirror how any saved workflow parses it (no positional mapping).
+      if (tokens.length && !tokens[0].includes("=")) {
+        parsed[tokenized.primary] = tokens[0];
+        if (tokens.length > 1 && parsed[tokenized.rest] === undefined) parsed[tokenized.rest] = tokens.slice(1);
+      }
+    }
+    startBackground(getManager(), ctx, name, saved.script, parsed);
     return true;
   }
 
@@ -401,6 +434,7 @@ export function registerBuiltinWorkflows(
         );
       },
     });
+    claimCommand(pi, "deep-research", "builtin");
   }
 
   if (!alreadyRegistered(pi, "adversarial-review")) {
@@ -415,6 +449,7 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "adversarial-review", resolved.script, { task });
       },
     });
+    claimCommand(pi, "adversarial-review", "builtin");
   }
 
   if (!alreadyRegistered(pi, "code-review")) {
@@ -534,6 +569,7 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "code-review", resolved.script, { diff, diffSource });
       },
     });
+    claimCommand(pi, "code-review", "builtin");
   }
 
   if (!alreadyRegistered(pi, "multi-perspective")) {
@@ -552,6 +588,7 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "multi-perspective", resolved.script);
       },
     });
+    claimCommand(pi, "multi-perspective", "builtin");
   }
 
   if (!alreadyRegistered(pi, "codebase-audit")) {
@@ -568,5 +605,6 @@ export function registerBuiltinWorkflows(
         startBackground(getManager(), ctx, "codebase-audit", resolved.script);
       },
     });
+    claimCommand(pi, "codebase-audit", "builtin");
   }
 }

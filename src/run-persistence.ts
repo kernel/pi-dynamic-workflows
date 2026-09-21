@@ -2,19 +2,28 @@
  * Workflow run state persistence for pause/resume support.
  */
 
+import { createHash, randomUUID } from "node:crypto";
 import { join } from "node:path";
 import type { AgentUsage } from "./agent.js";
 import type { AgentHistoryEntry } from "./agent-history.js";
-import type { WorkflowErrorCode } from "./errors.js";
+import { WorkflowErrorCode } from "./errors.js";
 import {
   ensureDir as ensureDirFs,
   listJsonFilesSafe,
   type PersistenceFsLayer,
-  readJsonWithBackupRecovery,
   resolvePersistenceFs,
   unlinkIfExistsSafe,
-  writeJsonAtomicWithBackup,
 } from "./fs-persistence.js";
+import { settleInterruptedPersistedAgents } from "./run-agent-settlement.js";
+import { createRunRecordStore } from "./run-record-store.js";
+
+export {
+  agentHasNonTerminalStatus,
+  INTERRUPTED_AGENT_CAUSE,
+  settleInterruptedPersistedAgents,
+} from "./run-agent-settlement.js";
+
+import type { WorkflowCheckpoint } from "./workflow.js";
 import { workflowProjectPaths } from "./workflow-paths.js";
 
 export type RunStatus = "pending" | "running" | "paused" | "completed" | "failed" | "aborted";
@@ -42,6 +51,31 @@ export interface PersistedAgentState {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Child SessionManager identity, captured before the first prompt. */
+  sessionId?: string;
+  /** Child session file, absent for in-memory child sessions. */
+  sessionFile?: string;
+}
+
+/** Serialized journal entry; runId is absent on legacy numeric-only journals. */
+export interface PersistedJournalEntry {
+  index: number;
+  runId?: string;
+  hash: string;
+  result: unknown;
+  storeDelta?: Record<string, unknown>;
+  /** The model the call ran on; absent on journals written before this field existed. */
+  model?: string;
+}
+
+/**
+ * Sanitize a persisted/incoming auto-resume attempt counter: corrupt or
+ * foreign values (non-number, NaN, Infinity, negative, non-integer) become
+ * undefined — a NaN/negative counter would defeat the scheduler's give-up
+ * cap and produce NaN timer delays (#207).
+ */
+export function sanitizeAutoResumeAttempts(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 export interface PersistedRunState {
@@ -49,15 +83,40 @@ export interface PersistedRunState {
   workflowName: string;
   script: string;
   args?: unknown;
-  /** The pi session this run belongs to. Runs persist on disk across sessions but
-   * the navigator shows only the current session's runs (undefined = legacy/global). */
+  /** The pi session currently used for run ownership/delivery. Runs persist on
+   * disk across sessions but the navigator shows only the current session's
+   * runs (undefined = legacy/global). */
   sessionId?: string;
+  /** Immutable parent session identity for this workflow run. */
+  parentSessionId?: string;
+  /** Immutable parent session file for this workflow run, when persisted. */
+  parentSessionFile?: string;
   status: RunStatus;
+  /**
+   * Terminal failure/abort message. Written for `failed` and `aborted` runs;
+   * absent on running/paused/completed and on records persisted before this field.
+   */
+  error?: string;
+  /**
+   * Classified terminal cause. Written with `error` for `failed` and `aborted`
+   * runs; absent on running/paused/completed and on legacy records.
+   */
+  errorCode?: WorkflowErrorCode;
   /** Why a paused run is paused (e.g. "usage_limit" when a provider quota was hit). */
   pauseReason?: string;
   /** Provider reset hint for a usage-limit pause, e.g. "Resets in ~3h" (verbatim). */
   resetHint?: string;
+  /** Durable workflow-controlled suspension and its at-most-once response. */
+  checkpoint?: WorkflowCheckpoint;
   phases: string[];
+  /**
+   * Per-phase soft sub-budgets declared so far in this run's lifetime, keyed by
+   * `${frameRunId}:${phaseTitle}` (nested workflow() frames have stable runIds
+   * across resume) -> ceiling + the run-wide spent baseline at declaration.
+   * Persisted so a resumed execution ADOPTS the original baseline instead of
+   * re-basing (audit2 #4) — a phase ceiling holds cumulatively across resume.
+   */
+  phaseBudgets?: Record<string, { budget: number; startSpent: number; warned?: boolean }>;
   currentPhase?: string;
   agents: PersistedAgentState[];
   logs: string[];
@@ -73,22 +132,18 @@ export interface PersistedRunState {
     cost?: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   };
   /**
    * Cached agent/checkpoint results for resume, keyed by deterministic call
    * index. `runId` namespaces `index` (a nested workflow() call restarts its
    * own callSeq at 0) — absent on journals persisted before that namespacing
-   * existed; see JournalEntry.runId in workflow.ts for the resume-time
-   * legacy-degradation behavior. `storeDelta` is this call's SharedStore
-   * write delta, replayed additively on resume.
+   * existed; see PersistedJournalEntry.runId in workflow.ts / the manager's
+   * resume() for the resume-time legacy-degradation behavior. `storeDelta` is
+   * this call's SharedStore write delta, replayed additively on resume.
    */
-  journal?: Array<{
-    index: number;
-    runId?: string;
-    hash: string;
-    result: unknown;
-    storeDelta?: Record<string, unknown>;
-  }>;
+  journal?: PersistedJournalEntry[];
   /**
    * Opt-out of auto-resume for this run (default true, i.e. eligible unless
    * explicitly set to false via ExecOptions.autoResume). Set once at run start
@@ -137,9 +192,10 @@ export interface PersistedRunState {
    */
   agentRetries?: number;
   /**
-   * Auto-resume attempt counter for the current usage_limit pause-cycle, owned
-   * and persisted by UsageLimitScheduler (best-effort). Absent/0 means no
-   * auto-resume attempt has been recorded yet.
+   * Auto-resume attempt counter for the current usage_limit pause-cycle.
+   * Owned by WorkflowManager (written on every persistRun; the scheduler
+   * records through recordAutoResumeAttempts, never a raw save — #207).
+   * Absent/0 means no auto-resume attempt has been recorded yet.
    */
   autoResumeAttempts?: number;
   /**
@@ -155,11 +211,25 @@ export interface PersistedRunState {
  * Disk/memory marker for a background result that still needs conversation
  * delivery. Kept small on purpose — never store full agent transcripts here.
  */
-export type PendingDeliveryMarker = { kind: "complete" } | { kind: "text"; text: string };
+export type PendingDeliveryMarker =
+  | { kind: "complete"; deliveryId?: string }
+  | { kind: "text"; text: string; deliveryId?: string };
 
 export interface RunPersistence {
+  /** Immutable, directly readable result artifact for conversation delivery. */
+  exportResult?(runId: string, result: unknown): string;
+  /** Read routing metadata without hydrating history; detail fields are lazy. */
+  loadPreview?(runId: string): PersistedRunState | null;
+  /** Under the caller's run lease, settle orphaned agents using a log delta. */
+  recoverInterrupted?(runId: string): boolean;
   /** Save current run state. */
   save(state: PersistedRunState): void;
+  /** Merge small delivery/ownership fields without hydrating the run history. */
+  updateMetadata?(
+    runId: string,
+    patch: Partial<Pick<PersistedRunState, "sessionId" | "pendingDelivery" | "autoResumeAttempts">>,
+    expectedDeliveryId?: string,
+  ): boolean;
   /** Load a persisted run by ID. */
   load(runId: string): PersistedRunState | null;
   /** List all persisted runs. */
@@ -209,7 +279,63 @@ export type FsLayer = PersistenceFsLayer;
  */
 export const DEFAULT_MAX_TERMINAL_RUNS_ON_DISK = 300;
 
-const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+export const TERMINAL_RUN_STATUSES: ReadonlySet<RunStatus> = new Set(["completed", "failed", "aborted"]);
+
+const PERSISTED_AGENT_STATUSES = [
+  "queued",
+  "running",
+  "done",
+  "error",
+  "skipped",
+] as const satisfies readonly PersistedAgentState["status"][];
+
+// Exhaustiveness: adding a member to PersistedAgentState["status"] without
+// listing it above fails to compile HERE (Exclude yields a non-never).
+type AssertNever<T extends never> = T;
+export type _PersistedAgentStatusExhaustiveCheck = AssertNever<
+  Exclude<PersistedAgentState["status"], (typeof PERSISTED_AGENT_STATUSES)[number]>
+>;
+
+/** Every status a persisted agent row may validly carry — exhaustively
+ * checked against PersistedAgentState["status"] by the assertion above.
+ * Forward-compat note: resume seeding DROPS rows with out-of-union statuses
+ * (e.g. written by a newer release) — deliberate garbage-vs-unknown tradeoff:
+ * an unknown status cannot be ghost-settled or displayed safely, so the row
+ * is treated as corrupt rather than re-persisted as a lie. */
+export const VALID_PERSISTED_AGENT_STATUSES: ReadonlySet<PersistedAgentState["status"]> = new Set(
+  PERSISTED_AGENT_STATUSES,
+);
+
+/** Cause stamped onto leftover in-flight agents when a run reaches a terminal status. */
+export function terminalRunInterruptCause(
+  status: RunStatus,
+  error?: { message?: string; code?: WorkflowErrorCode },
+): { error: string; errorCode?: WorkflowErrorCode } {
+  if (status === "aborted") {
+    return { error: "aborted", errorCode: error?.code ?? WorkflowErrorCode.WORKFLOW_ABORTED };
+  }
+  if (status === "failed") {
+    return {
+      error: error?.message ?? "run failed",
+      errorCode: error?.code ?? WorkflowErrorCode.UNKNOWN,
+    };
+  }
+  return { error: "run completed" };
+}
+
+/**
+ * Fail-closed rewrite of leftover queued/running agents on a terminal run.
+ * Completed/failed/aborted must never persist a still-`running` agent.
+ */
+export function settleNonTerminalPersistedAgents(
+  agents: PersistedAgentState[],
+  status: RunStatus,
+  error: { message?: string; code?: WorkflowErrorCode } | undefined,
+  endedAt: string,
+): PersistedAgentState[] {
+  if (!TERMINAL_RUN_STATUSES.has(status)) return agents;
+  return settleInterruptedPersistedAgents(agents, terminalRunInterruptCause(status, error), endedAt);
+}
 
 export interface RunPersistenceOptions {
   /** Override DEFAULT_MAX_TERMINAL_RUNS_ON_DISK (tests; advanced tuning). */
@@ -217,14 +343,8 @@ export interface RunPersistenceOptions {
 }
 
 /**
- * `list()` does a full readdirSync + per-file readFileSync + JSON.parse of the
- * entire lifetime run history. It is called on essentially every progress tick
- * (task-panel re-render → WorkflowManager.listRuns()/listAllRuns()), so an
- * unbounded number of ticks each re-walked and re-parsed every run file on
- * disk. Cache the computed list for a short TTL — long enough to absorb a
- * burst of same-tick reads, short enough that a read from a DIFFERENT process
- * (or a mutation this instance doesn't own) still shows up quickly. Mirrors
- * the ~1s settings-read TTL cache in task-panel.ts.
+ * Absorb same-tick list reads before checking directory stamps and reconciling
+ * lightweight per-file views. Full histories are hydrated only on demand.
  */
 const LIST_CACHE_TTL_MS = 300;
 
@@ -234,6 +354,7 @@ export function createRunPersistence(
   options?: RunPersistenceOptions,
 ): RunPersistence {
   const fs = resolvePersistenceFs(fsOverride);
+  const records = createRunRecordStore(fs);
   const _existsSync = fs.existsSync;
   const _readFileSync = fs.readFileSync;
   const _statSync = fs.statSync;
@@ -275,6 +396,62 @@ export function createRunPersistence(
   };
 
   const readLock = (runId: string): LockFile | null => readLockAt(primaryLockPath(runId));
+  // Short writer mutex serializes append + head commit, including metadata
+  // writes while a long-lived execution lease is held. Never busy-wait.
+  const mutate = <T>(runId: string, fn: () => T): T => {
+    ensureDir();
+    const path = `${primaryRunPath(runId)}.write-lock`;
+    const token = `${process.pid}-${Date.now()}-${Math.random()}`;
+    const ownerFile = `${path}.${randomUUID()}.owner`;
+    const release = (target: string) => {
+      if (readLockAt(target)?.token === token) unlinkIfExistsSafe(fs, target);
+    };
+    const claim = (target: string, depth = 0): void => {
+      if (depth > 8) throw new Error("Run writer recovery chain is too deep");
+      for (let attempt = 0; ; attempt++) {
+        try {
+          fs.linkSync(ownerFile, target);
+          return;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt > 0) throw error;
+          const existing = readLockAt(target);
+          if (
+            !existing ||
+            typeof existing.token !== "string" ||
+            !Number.isInteger(existing.pid) ||
+            existing.pid <= 0 ||
+            pidIsAlive(existing.pid)
+          )
+            throw error;
+          // Serialize reapers of this exact dead-owner incarnation. Without
+          // this guard, a second reaper could unlink a new live mutex after
+          // both had observed the same stale owner.
+          const key = createHash("sha256").update(`${target}\0${existing.token}`).digest("hex");
+          const guard = `${path}.reap-${key}`;
+          claim(guard, depth + 1);
+          try {
+            if (readLockAt(target)?.token === existing.token) _unlinkSync(target);
+          } finally {
+            release(guard);
+          }
+        }
+      }
+    };
+    // Publish a fully written owner atomically. A process dying between open
+    // and write can leave only an unlinked candidate, never an empty mutex.
+    try {
+      _writeFileSync(ownerFile, JSON.stringify({ pid: process.pid, token }), { flag: "wx" });
+      claim(path);
+    } finally {
+      unlinkIfExistsSafe(fs, ownerFile);
+    }
+    try {
+      return fn();
+    } finally {
+      release(path);
+      invalidateListCache();
+    }
+  };
 
   // list() cache: recomputed lazily, invalidated synchronously by every
   // mutation this instance performs (save()/delete()) so a stale read can
@@ -283,6 +460,19 @@ export function createRunPersistence(
   // elapses, same as before this cache existed on the next un-cached call.
   let listCache: PersistedRunState[] | undefined;
   let listCacheAt = 0;
+  let directoryStamp = "";
+  let reconciledAt = 0;
+  const directoryVersion = () =>
+    [runsDir, legacyRunsDir]
+      .map((dir) => {
+        try {
+          const s = fs.statSync(dir);
+          return `${s.ino}:${s.mtimeMs}:${s.ctimeMs}`;
+        } catch {
+          return "missing";
+        }
+      })
+      .join("|");
   const invalidateListCache = () => {
     listCache = undefined;
   };
@@ -341,7 +531,8 @@ export function createRunPersistence(
             if (!byRunId.has(cached.state.runId)) byRunId.set(cached.state.runId, cached.state);
             continue;
           }
-          const state = JSON.parse(_readFileSync(path, "utf-8")) as PersistedRunState;
+          const record = JSON.parse(_readFileSync(path, "utf-8"));
+          const state = records.preview(path, record);
           fileStateCache.set(path, { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, state });
           if (!byRunId.has(state.runId)) byRunId.set(state.runId, state);
         } catch {
@@ -362,36 +553,97 @@ export function createRunPersistence(
   // Bound the number of terminal (completed/failed/aborted) runs kept on
   // disk (see DEFAULT_MAX_TERMINAL_RUNS_ON_DISK) — called after every save()
   // whose state is terminal, since that's the only time the terminal count
-  // can grow. Running/paused runs are never candidates: they're filtered out
-  // before the cap is even considered.
+  // can grow. Running/paused and undelivered runs are never candidates: they're
+  // filtered out before the cap is even considered.
   const enforceRetention = () => {
     const terminal = computeList()
-      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status))
+      .filter((r) => TERMINAL_RUN_STATUSES.has(r.status) && !r.pendingDelivery)
       .sort((a, b) => new Date(a.updatedAt).getTime() - new Date(b.updatedAt).getTime());
     const excess = terminal.length - maxTerminalRunsOnDisk;
     if (excess <= 0) return;
     for (const run of terminal.slice(0, excess)) {
-      deleteRunFiles(run.runId);
+      try {
+        mutate(run.runId, () => {
+          if (
+            [primaryLockPath(run.runId), legacyLockPath(run.runId)].some((path) => {
+              const lock = readLockAt(path);
+              return lock && pidIsAlive(lock.pid);
+            })
+          )
+            return;
+          const fresh = records.peek(primaryRunPath(run.runId)) ?? records.peek(legacyRunPath(run.runId));
+          if (fresh && TERMINAL_RUN_STATUSES.has(fresh.status) && !fresh.pendingDelivery) deleteRunFiles(run.runId);
+        });
+      } catch {
+        // Contended or unreadable records remain available for the next pass.
+      }
     }
     invalidateListCache();
   };
 
   const deleteRunFiles = (runId: string): boolean => {
     let deleted = false;
+    const unlinkData = (path: string): boolean => {
+      try {
+        _unlinkSync(path);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+        throw error;
+      }
+    };
     for (const path of candidateRunPaths(runId)) {
-      const dir = path === primaryRunPath(runId) ? runsDir : legacyRunsDir;
-      // Best-effort cleanup of the sidecar files alongside the primary.
-      for (const sidecar of [`${path}.bak`, `${path}.tmp`, lockPath(dir, runId)]) {
-        unlinkIfExistsSafe(fs, sidecar);
+      // Delete every readable recovery candidate before releasing either lock:
+      // a foreign resume that acquires between those operations must never find
+      // a surviving primary, backup, or legacy record to resurrect.
+      for (const sidecar of [`${path}.bak`, `${path}.tmp`, records.logPath(path)]) {
+        unlinkData(sidecar);
         fileStateCache.delete(sidecar);
       }
-      if (unlinkIfExistsSafe(fs, path)) deleted = true;
+      if (unlinkData(path)) deleted = true;
       fileStateCache.delete(path);
+      records.forget(path);
+    }
+    for (const dir of [runsDir, legacyRunsDir]) {
+      if (!_existsSync(dir)) continue;
+      for (const name of fs.readdirSync(dir)) {
+        if (
+          name.startsWith(`${runId}.json.result-`) ||
+          (name.startsWith(`${runId}.json.write-lock.`) && (name.endsWith(".owner") || name.includes(".reap-")))
+        )
+          unlinkData(join(dir, name));
+      }
+    }
+    // Locks come LAST, after both primary and legacy data/recovery candidates
+    // have been removed. deleteRun() deliberately holds its acquired lease
+    // across this sequence, so opening this final release window sooner would
+    // let another process resume a record that is about to be deleted.
+    for (const lock of [primaryLockPath(runId), legacyLockPath(runId)]) {
+      unlinkIfExistsSafe(fs, lock);
+      fileStateCache.delete(lock);
     }
     return deleted;
   };
 
   return {
+    exportResult(runId, result) {
+      return mutate(runId, () => {
+        if (!candidateRunPaths(runId).some((path) => _existsSync(path)))
+          throw new Error("Run disappeared before result export");
+        const json = JSON.stringify({ runId, result }, null, 2);
+        const hash = createHash("sha256").update(json).digest("hex");
+        const path = `${primaryRunPath(runId)}.result-${hash}`;
+        if (_existsSync(path)) return path;
+        const temporary = `${path}.${randomUUID()}.tmp`;
+        try {
+          _writeFileSync(temporary, json, { flush: true });
+          fs.renameSync(temporary, path);
+        } finally {
+          unlinkIfExistsSafe(fs, temporary);
+        }
+        return path;
+      });
+    },
     save(state: PersistedRunState) {
       ensureDir();
       state.updatedAt = new Date().toISOString();
@@ -399,7 +651,7 @@ export function createRunPersistence(
       // Atomic write: a crash mid-write can't corrupt the live file (tmp+rename is
       // atomic on the same filesystem). A .bak from the previous good save is the
       // recovery fallback if the primary is somehow truncated.
-      writeJsonAtomicWithBackup(fs, path, state);
+      mutate(state.runId, () => records.save(path, state));
       invalidateListCache();
       // Only a terminal write can grow the terminal-run count, so only check
       // the cap then — a "running"/"paused" save is on the hot path (every
@@ -407,10 +659,42 @@ export function createRunPersistence(
       if (TERMINAL_RUN_STATUSES.has(state.status)) enforceRetention();
     },
 
+    loadPreview(runId) {
+      for (const path of candidateRunPaths(runId)) {
+        const record = records.peek(path);
+        if (record) return record;
+      }
+      return null;
+    },
+
+    recoverInterrupted(runId) {
+      return mutate(runId, () => {
+        for (const path of candidateRunPaths(runId)) {
+          if (_existsSync(path) || _existsSync(`${path}.bak`)) return records.recoverInterrupted(path);
+        }
+        return false;
+      });
+    },
+
+    updateMetadata(runId, patch, expectedDeliveryId) {
+      return mutate(runId, () => {
+        for (const path of candidateRunPaths(runId)) {
+          if (_existsSync(path) || _existsSync(`${path}.bak`))
+            return records.updateMetadata(path, patch, expectedDeliveryId);
+        }
+        return false;
+      });
+    },
+
     load(runId: string): PersistedRunState | null {
       // Try the primary, then the .bak — so a corrupt primary doesn't lose the run.
       for (const path of candidateRunPaths(runId)) {
-        const state = readJsonWithBackupRecovery<PersistedRunState>(fs, path);
+        let state: PersistedRunState | null;
+        try {
+          state = records.read(path);
+        } catch {
+          return null;
+        }
         if (state) return state;
       }
       return null;
@@ -424,15 +708,24 @@ export function createRunPersistence(
       if (listCache && now - listCacheAt < LIST_CACHE_TTL_MS) {
         return [...listCache];
       }
+      // Cooperative writers replace heads atomically, changing the directory
+      // stamp. Reconcile in-place external edits at most every five seconds.
+      const stamp = directoryVersion();
+      if (listCache && stamp === directoryStamp && now - reconciledAt < 5000) {
+        listCacheAt = now;
+        return [...listCache];
+      }
       const result = computeList();
       listCache = result;
       listCacheAt = now;
+      reconciledAt = now;
+      directoryStamp = stamp;
       return [...result];
     },
 
     delete(runId: string): boolean {
       try {
-        return deleteRunFiles(runId);
+        return mutate(runId, () => deleteRunFiles(runId));
       } finally {
         invalidateListCache();
       }

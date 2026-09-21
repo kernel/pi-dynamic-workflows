@@ -3,7 +3,7 @@ import test from "node:test";
 import { Check } from "typebox/value";
 import type { WorkflowSnapshot } from "../src/display.js";
 import type { PersistedRunState, RunStatus } from "../src/run-persistence.js";
-import { createWorkflowControlTool } from "../src/workflow-control-tool.js";
+import { createWorkflowControlTool, type WorkflowControlRunDetails } from "../src/workflow-control-tool.js";
 import type { WorkflowManager } from "../src/workflow-manager.js";
 
 function run(status: RunStatus = "running", runId = "audit-abc123"): PersistedRunState {
@@ -29,9 +29,10 @@ function run(status: RunStatus = "running", runId = "audit-abc123"): PersistedRu
 
 function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string, WorkflowSnapshot> = {}) {
   const runs = new Map(initial.map((item) => [item.runId, item]));
-  const calls: Array<{ action: string; runId: string }> = [];
+  const calls: Array<{ action: string; runId: string; checkpointId?: string; response?: unknown }> = [];
   const manager = {
     listRuns: () => [...runs.values()],
+    listAllRuns: () => [...runs.values()],
     getSnapshot: (runId: string) => liveSnapshots[runId] ?? null,
     pause(runId: string) {
       calls.push({ action: "pause", runId });
@@ -40,8 +41,8 @@ function fakeManager(initial: PersistedRunState[], liveSnapshots: Record<string,
       item.status = "paused";
       return true;
     },
-    async resume(runId: string) {
-      calls.push({ action: "resume", runId });
+    async resume(runId: string, options?: { checkpointId?: string; response?: unknown }) {
+      calls.push({ action: "resume", runId, ...options });
       const item = runs.get(runId);
       if (!item || (item.status !== "paused" && item.status !== "failed" && item.status !== "pending")) return false;
       item.status = "running";
@@ -86,6 +87,11 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.equal(Check(tool.parameters, { action: "pause", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "resume", runId: "abc" }), true);
   assert.equal(Check(tool.parameters, { action: "stop", runId: "abc" }), true);
+  assert.equal(Check(tool.parameters, { action: "resume", runId: "abc", checkpointId: "proposal-1" }), true);
+  assert.equal(
+    Check(tool.parameters, { action: "resume", runId: "abc", checkpointId: "proposal-1", response: {} }),
+    false,
+  );
   assert.equal(Check(tool.parameters, { action: "status" }), true, "runId is optional at the schema level");
   assert.equal(Check(tool.parameters, { action: "restart", runId: "abc" }), false);
   assert.equal(Check(tool.parameters, { action: "remove", runId: "abc" }), false);
@@ -100,6 +106,7 @@ test("workflow_control exposes only list, status, pause, resume, and stop in a s
   assert.throws(() => prepare({ action: "list", runId: "abc" }), /does not accept runId/);
   assert.throws(() => prepare({ action: "status", runId: "abc", extra: true }), /does not accept extra/);
   assert.throws(() => prepare({ action: "restart", runId: "abc" }), /requires action/);
+  assert.throws(() => prepare({ action: "status", runId: "abc", response: {} }), /does not accept response/);
 });
 
 test("list and status return stable lifecycle and observability fields", async () => {
@@ -119,9 +126,11 @@ test("list and status return stable lifecycle and observability fields", async (
         workflowName: "audit",
         status: "running",
         phase: "Inspect",
+        checkpoint: null,
         counts: { total: 4, done: 0, running: 1, queued: 1, error: 1, skipped: 1 },
         activeLabels: ["active scan"],
         tokenTotal: 30,
+        tokenTotalEstimated: false,
       },
     ],
   });
@@ -131,6 +140,29 @@ test("list and status return stable lifecycle and observability fields", async (
   assert.equal(status.details.action, "status");
   assert.equal((status.details.run as { runId: string }).runId, "audit-abc123");
   assert.doesNotMatch(text(status), /\/workflows/);
+});
+
+test("status exposes checkpoint identity but not its payload or response", async () => {
+  const persisted = run("paused");
+  persisted.checkpoint = {
+    version: 1,
+    checkpointId: "publish-1",
+    kind: "custom-controller-event",
+    status: "resuming",
+    payload: { privateDraft: "do-not-show" },
+    response: { privateReceipt: "do-not-show" },
+    createdAt: new Date().toISOString(),
+  };
+  const { manager } = fakeManager([persisted]);
+
+  const status = await execute(manager, { action: "status", runId: persisted.runId });
+
+  assert.deepEqual((status.details.run as WorkflowControlRunDetails).checkpoint, {
+    checkpointId: "publish-1",
+    kind: "custom-controller-event",
+    status: "resuming",
+  });
+  assert.doesNotMatch(JSON.stringify(status), /do-not-show|privateDraft|privateReceipt/);
 });
 
 test("status uses agent usage when the live run aggregate is lagging", async () => {
@@ -183,9 +215,52 @@ test("pause, resume, and stop call the shared manager lifecycle methods", async 
   );
 });
 
+test("resume forwards only the durable checkpoint ID", async () => {
+  const fixture = fakeManager([run("paused")]);
+  const response = await execute(fixture.manager, {
+    action: "resume",
+    runId: "audit-abc123",
+    checkpointId: "proposal-1",
+  });
+
+  assert.match(text(response), /result=resumed/);
+  assert.deepEqual(fixture.calls, [
+    {
+      action: "resume",
+      runId: "audit-abc123",
+      checkpointId: "proposal-1",
+    },
+  ]);
+});
+
+test("resume resolves a paused checkpoint from a prior pi session", async () => {
+  const persisted = run("paused");
+  const fixture = fakeManager([persisted]);
+  const manager = {
+    ...fixture.manager,
+    listRuns: () => [],
+    listAllRuns: () => [persisted],
+  } as unknown as WorkflowManager;
+
+  const response = await execute(manager, {
+    action: "resume",
+    runId: persisted.runId,
+    checkpointId: "proposal-1",
+  });
+
+  assert.match(text(response), /result=resumed/);
+  assert.deepEqual(fixture.calls, [
+    {
+      action: "resume",
+      runId: persisted.runId,
+      checkpointId: "proposal-1",
+    },
+  ]);
+});
+
 test("stop succeeds via the tool for a run resolved from disk but not tracked in memory (cold pi restart)", async () => {
   // Regression guard for the workflow_control "stop" bug: findRun() resolves
-  // candidates from manager.listRuns() (disk-backed), so a run persisted as
+  // candidates from manager.listAllRuns() (disk-backed), so a run persisted as
   // "paused" by a prior pi session — never loaded into the manager's
   // in-memory map — is still advertised with "stop" as an allowed action.
   // Before the fix, manager.stop() only checked its in-memory map and
@@ -195,6 +270,7 @@ test("stop succeeds via the tool for a run resolved from disk but not tracked in
   const runs = new Map([[coldRun.runId, coldRun]]);
   const manager = {
     listRuns: () => [...runs.values()],
+    listAllRuns: () => [...runs.values()],
     getSnapshot: () => null,
     pause: () => false,
     async resume() {
@@ -220,6 +296,7 @@ test("a thrown error from the manager during an action is reported as a structur
   const throwingRun = run("paused", "throws-1");
   const manager = {
     listRuns: () => [throwingRun],
+    listAllRuns: () => [throwingRun],
     getSnapshot: () => null,
     pause: () => false,
     async resume() {
@@ -250,4 +327,65 @@ test("unknown IDs and illegal transitions return explicit errors with allowed ac
   const stopAborted = text(await execute(fixture.manager, { action: "stop", runId: "live-123" }));
   assert.match(stopAborted, /cannot stop run with status aborted/);
   assert.match(stopAborted, /allowed=status/);
+});
+
+test("status marks heuristic-estimated token totals with ~ and a details flag (#209)", async () => {
+  const estimatedRun: PersistedRunState = {
+    ...run("completed"),
+    tokenUsage: { input: 0, output: 0, total: 200, estimated: true },
+  };
+  const { manager } = fakeManager([estimatedRun]);
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~200$/, "a char-heuristic total never renders as metered");
+  assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
+});
+
+test("status marks a LIVE snapshot's estimated totals with ~ (#209)", async () => {
+  const live: WorkflowSnapshot = {
+    name: "audit",
+    phases: ["Inspect"],
+    currentPhase: "Inspect",
+    logs: [],
+    agents: [],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+    tokenUsage: { input: 0, output: 0, total: 640, estimated: true },
+  } as WorkflowSnapshot;
+  const { manager } = fakeManager([run("running")], { "audit-abc123": live });
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~640$/, "the live-usage branch carries the flag");
+  assert.equal((status.details.run as { tokenTotalEstimated: boolean }).tokenTotalEstimated, true);
+});
+
+test("status marks an agent-sum-derived estimated total with ~ (#209)", async () => {
+  // Only the per-AGENT figures are flagged; the run aggregate is unflagged and
+  // smaller, so the agent sum wins the display — its flag must come along.
+  const live = {
+    name: "audit",
+    phases: ["Inspect"],
+    currentPhase: "Inspect",
+    logs: [],
+    agents: [
+      {
+        id: 1,
+        label: "scan",
+        phase: "Inspect",
+        prompt: "scan",
+        status: "running",
+        tokens: 0,
+        tokenUsage: { input: 0, output: 80, cacheRead: 0, cacheWrite: 0, total: 80, cost: 0, estimated: true },
+      },
+    ],
+    agentCount: 1,
+    runningCount: 1,
+    doneCount: 0,
+    errorCount: 0,
+    tokenUsage: { input: 5, output: 5, total: 10 },
+  } as unknown as WorkflowSnapshot;
+  const { manager } = fakeManager([run("running")], { "audit-abc123": live });
+  const status = await execute(manager, { action: "status", runId: "audit-abc123" });
+  assert.match(text(status), /tokens=~80$/, "the agent-usage branch carries the flag");
+  assert.equal((status.details.run as { tokenTotalEstimated?: boolean }).tokenTotalEstimated, true);
 });

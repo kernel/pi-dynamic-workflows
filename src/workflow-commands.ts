@@ -14,6 +14,7 @@ import {
 } from "./display.js";
 import { type EffortState, effortDirective } from "./effort-command.js";
 import type { PersistedRunState } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import { registerSavedWorkflow } from "./saved-commands.js";
 import { buildForcedWorkflowPrompt, WORKFLOW_TOOL_NAME } from "./workflow-editor.js";
 import type { WorkflowManager } from "./workflow-manager.js";
@@ -36,8 +37,7 @@ const RUN_USAGE = "Usage: /workflows run <prompt> — force a dynamic workflow f
 
 function summarizeRun(run: PersistedRunState): string {
   const icon = STATUS_ICON[run.status] ?? "?";
-  const done = run.agents.filter((a) => a.status === "done").length;
-  const total = run.agents.length;
+  const { done, total } = runSummary(run);
   const segment = fmtTokenSegment(tokenFigures(run.tokenUsage), fmtFull);
   const tokens = segment ? ` · ${segment}` : "";
   return `${icon} ${run.runId}  ${run.workflowName} [${run.status}] ${done}/${total} agents${tokens}`;
@@ -73,22 +73,26 @@ function watchRun(manager: WorkflowManager, pi: ExtensionAPI, ctx: ExtensionComm
     if (!e || e.runId === id) update();
   };
   let settled = false;
-  const progressEvents = ["agentStart", "agentEnd", "phase", "log"];
-  const finalEvents = ["complete", "error", "stopped", "paused"];
+  const progressEvents = ["agentStart", "agentEnd", "phase", "log", "tokenUsage"];
+  const finalEvents = ["complete", "error", "stopped", "paused", "deleted"];
   const finish = (e: { runId?: string }) => {
     if (e && e.runId !== id) return;
     if (settled) return;
     settled = true;
     for (const ev of progressEvents) manager.off(ev, onEvent);
     for (const ev of finalEvents) manager.off(ev, finish);
-    ctx.ui.setStatus(key, undefined);
-    const run = manager.getRun(id);
-    if (run) {
-      void pi.sendMessage({
-        customType: "workflows",
-        content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
-        display: true,
-      });
+    try {
+      ctx.ui.setStatus(key, undefined);
+      const run = manager.getRun(id);
+      if (run) {
+        pi.sendMessage({
+          customType: "workflows",
+          content: renderWorkflowText(recomputeWorkflowSnapshot(run.snapshot), true),
+          display: true,
+        });
+      }
+    } catch {
+      // Listeners are already removed; a stale-ctx/UI failure is not actionable.
     }
   };
   for (const ev of progressEvents) manager.on(ev, onEvent);
@@ -194,19 +198,13 @@ export function registerWorkflowCommands(
         }
         case "ui":
         case "list": {
-          // Interactive navigator when a UI is available; plain text otherwise
-          // (print/RPC mode) or when the user explicitly asks for `list`.
-          if (sub !== "list" && ctx.hasUI) {
-            await openWorkflowNavigator(pi, manager, ctx.ui, {
-              storage: getStorage(),
-              cwd: getCwd(),
-              getStorage,
-              getCwd,
-              getManager,
-            });
-            return;
-          }
-          if (parts.length === 0 && ctx.hasUI) {
+          // Interactive navigator only in the TUI — it is a ui.custom()
+          // component, which no-ops in RPC hosts even though ctx.hasUI is true
+          // there (dialogs and notifications work over the RPC extension-UI
+          // protocol; custom components do not). Everything else, including
+          // an explicit `list`, gets the plain-text run list.
+          const wantsNavigator = sub !== "list" || parts.length === 0;
+          if (wantsNavigator && ctx.mode === "tui") {
             await openWorkflowNavigator(pi, manager, ctx.ui, {
               storage: getStorage(),
               cwd: getCwd(),
@@ -233,7 +231,12 @@ export function registerWorkflowCommands(
           // A running run streams live progress to the status bar and prints the
           // final snapshot when it finishes — no need to re-run the command.
           if (watchRun(manager, pi, ctx, id)) {
-            ctx.ui.notify(`Watching ${id} — live progress in the status bar; result prints when it finishes.`, "info");
+            ctx.ui.notify(
+              ctx.mode === "tui"
+                ? `Watching ${id} — live progress in the status bar; result prints when it finishes.`
+                : `Watching ${id} — the final status prints here when it finishes.`,
+              "info",
+            );
             return;
           }
           const live = manager.getSnapshot(id);
@@ -285,7 +288,19 @@ export function registerWorkflowCommands(
         }
         case "rm": {
           if (!id) return ctx.ui.notify(USAGE, "warning");
-          ctx.ui.notify(manager.deleteRun(id) ? `Removed ${id}` : `No run ${id}`, "info");
+          if (manager.deleteRun(id)) {
+            ctx.ui.notify(`Removed ${id}`, "info");
+            return;
+          }
+          // Distinguish a lease refusal from "no such run" (audit2 #16 r1
+          // MINOR 2): the run may exist but be leased by a live process
+          // (resumed/running in another session) — saying "No run" would lie
+          // while that process burns tokens.
+          const known = manager.getRun(id) ?? manager.getPersistence?.().load(id);
+          ctx.ui.notify(
+            known ? `Cannot remove ${id}: it is active in another live session` : `No run ${id}`,
+            known ? "warning" : "info",
+          );
           return;
         }
         case "save": {
@@ -313,7 +328,7 @@ export function registerWorkflowCommands(
             ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
             return;
           }
-          registerSavedWorkflow(
+          const registration = registerSavedWorkflow(
             pi,
             getCwd,
             saved,
@@ -324,7 +339,17 @@ export function registerWorkflowCommands(
             () => getStorage()?.load(name) != null,
             () => getStorage()?.load(name) ?? null,
           );
-          ctx.ui.notify(`Saved /${name} (from ${run.runId})`, "info");
+          // Surface a refused registration (audit2 #35): the file persisted,
+          // but a host/extension-owned name never becomes a slash command —
+          // reporting plain success would silently mislead.
+          if (registration.ok) {
+            ctx.ui.notify(`Saved /${name} (from ${run.runId})`, "info");
+          } else {
+            ctx.ui.notify(
+              `Saved "${name}" to the library, but it cannot be registered as a slash command: ${registration.message}`,
+              "warning",
+            );
+          }
           return;
         }
         default:

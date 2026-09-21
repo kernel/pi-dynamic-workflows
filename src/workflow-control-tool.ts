@@ -2,6 +2,7 @@ import { defineTool, type ToolDefinition } from "@earendil-works/pi-coding-agent
 import { type Static, Type } from "typebox";
 import { aggregateAgentUsage, tokenFigures, type WorkflowAgentSnapshot, type WorkflowSnapshot } from "./display.js";
 import type { PersistedRunState, RunStatus } from "./run-persistence.js";
+import { runSummary } from "./run-record-store.js";
 import type { WorkflowManager } from "./workflow-manager.js";
 
 // A tool's top-level parameter schema must be a JSON Schema object (`type:
@@ -30,6 +31,12 @@ const workflowControlSchema = Type.Object(
         description: "Canonical workflow run ID. Required for status, pause, resume, and stop; omit for list.",
       }),
     ),
+    checkpointId: Type.Optional(
+      Type.String({
+        minLength: 1,
+        description: "Exact durable checkpoint ID with an attached controller response. For resume only.",
+      }),
+    ),
   },
   { additionalProperties: false },
 );
@@ -47,6 +54,7 @@ export interface WorkflowControlRunDetails {
   workflowName: string;
   status: RunStatus;
   phase: string | null;
+  checkpoint: Pick<NonNullable<PersistedRunState["checkpoint"]>, "checkpointId" | "kind" | "status"> | null;
   counts: {
     total: number;
     done: number;
@@ -57,6 +65,9 @@ export interface WorkflowControlRunDetails {
   };
   activeLabels: string[];
   tokenTotal: number;
+  /** True when tokenTotal includes character-heuristic estimates (#209). */
+  /** Always emitted by the built-in tool; optional only for external constructors of this exported shape. */
+  tokenTotalEstimated?: boolean;
 }
 
 type ControlResult = {
@@ -118,9 +129,11 @@ export function createWorkflowControlTool(
           case "pause":
             if (!manager.pause(run.runId)) return invalidTransition("pause", run);
             return actionSuccess("pause", "paused", currentSummary(manager, run));
-          case "resume":
-            if (!(await manager.resume(run.runId))) return invalidTransition("resume", run);
+          case "resume": {
+            const resumeOptions = params.checkpointId === undefined ? undefined : { checkpointId: params.checkpointId };
+            if (!(await manager.resume(run.runId, resumeOptions))) return invalidTransition("resume", run);
             return actionSuccess("resume", "resumed", currentSummary(manager, run));
+          }
           case "stop":
             if (!manager.stop(run.runId)) return invalidTransition("stop", run);
             return actionSuccess("stop", "stopped", currentSummary(manager, run));
@@ -146,12 +159,24 @@ function normalizeInput(value: unknown): WorkflowControlInput {
     throw new Error("workflow_control requires action: list|status|pause|resume|stop");
   }
 
-  const allowedKeys = input.action === "list" ? new Set(["action"]) : new Set(["action", "runId"]);
+  const allowedKeys =
+    input.action === "list"
+      ? new Set(["action"])
+      : input.action === "resume"
+        ? new Set(["action", "runId", "checkpointId"])
+        : new Set(["action", "runId"]);
   const extraKey = Object.keys(input).find((key) => !allowedKeys.has(key));
   if (extraKey) throw new Error(`workflow_control action "${input.action}" does not accept ${extraKey}`);
 
   if (input.action !== "list" && (typeof input.runId !== "string" || !input.runId.trim())) {
     throw new Error(`workflow_control action "${input.action}" requires runId`);
+  }
+  if (
+    input.action === "resume" &&
+    Object.hasOwn(input, "checkpointId") &&
+    (typeof input.checkpointId !== "string" || input.checkpointId.length === 0)
+  ) {
+    throw new Error('workflow_control action "resume" requires a non-empty checkpointId');
   }
   return input as WorkflowControlInput;
 }
@@ -161,7 +186,7 @@ function result(text: string, details: Record<string, unknown>): ControlResult {
 }
 
 function findRun(manager: WorkflowManager, runId: string): PersistedRunState | undefined {
-  return manager.listRuns().find((candidate) => candidate.runId === runId);
+  return manager.listAllRuns().find((candidate) => candidate.runId === runId);
 }
 
 function currentSummary(manager: WorkflowManager, fallback: PersistedRunState): WorkflowControlRunDetails {
@@ -204,23 +229,37 @@ function allowedActions(status: RunStatus): string[] {
 }
 
 function summarizeRun(run: PersistedRunState, live?: WorkflowSnapshot | null): WorkflowControlRunDetails {
-  const agents = live?.agents ?? run.agents;
-  const counts = countAgents(agents);
+  const summary = runSummary(run);
+  const agents = live?.agents ?? [];
+  const counts = live
+    ? countAgents(agents)
+    : {
+        total: summary.total,
+        done: summary.done,
+        running: summary.running,
+        queued: summary.queued,
+        error: summary.error,
+        skipped: summary.skipped,
+      };
   const liveUsage = tokenFigures(live?.tokenUsage);
   const persistedUsage = tokenFigures(run.tokenUsage);
-  const agentUsage = aggregateAgentUsage(agents);
+  const agentUsage = live ? aggregateAgentUsage(agents) : summary.usage;
   return {
     runId: run.runId,
     workflowName: live?.name ?? run.workflowName,
     status: run.status,
     phase: live?.currentPhase ?? run.currentPhase ?? null,
+    checkpoint: summary.checkpoint,
     counts,
-    activeLabels: agents.filter((agent) => agent.status === "running").map((agent) => agent.label),
+    activeLabels: live
+      ? agents.filter((agent) => agent.status === "running").map((agent) => agent.label)
+      : summary.activeLabels,
     tokenTotal: Math.max(
       liveUsage.fresh + liveUsage.cacheRead,
       persistedUsage.fresh + persistedUsage.cacheRead,
       agentUsage.fresh + agentUsage.cacheRead,
     ),
+    tokenTotalEstimated: liveUsage.estimated || persistedUsage.estimated || agentUsage.estimated,
   };
 }
 
@@ -237,7 +276,8 @@ function countAgents(agents: Array<Pick<WorkflowAgentSnapshot, "status">>): Work
 
 function formatRun(run: WorkflowControlRunDetails): string {
   const active = run.activeLabels.join(",") || "-";
-  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotal}`;
+  const checkpoint = JSON.stringify(run.checkpoint ?? null);
+  return `runId=${run.runId} name=${quote(run.workflowName)} status=${run.status} phase=${quote(run.phase ?? "-")} checkpoint=${checkpoint} total=${run.counts.total} done=${run.counts.done} running=${run.counts.running} queued=${run.counts.queued} error=${run.counts.error} skipped=${run.counts.skipped} active=${quote(active)} tokens=${run.tokenTotalEstimated ? "~" : ""}${run.tokenTotal}`;
 }
 
 function quote(value: string): string {

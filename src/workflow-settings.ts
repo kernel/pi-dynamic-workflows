@@ -6,14 +6,19 @@
  */
 
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord } from "./config.js";
+import { dirname, join, resolve } from "node:path";
+import { MAX_AGENT_RETRIES, MAX_CONCURRENCY, normalizeKeywordTriggerWord, WORKFLOW_SETTINGS_FILE } from "./config.js";
 import { workflowHomeDir, workflowProjectPaths } from "./workflow-paths.js";
 
 export interface WorkflowSettings {
   keywordTriggerEnabled?: boolean;
   /** Literal keyword that arms workflows mode from interactive input. */
   keywordTriggerWord?: string;
+  /**
+   * Initial in-memory orchestration effort for a fresh Pi session. Omitted
+   * (the default) is "off"; slash commands never write this preference.
+   */
+  defaultEffort?: "off" | "high" | "ultra";
   defaultAgentTimeoutMs?: number | null;
   /**
    * Default hard token budget applied to runs that don't pass their own
@@ -37,6 +42,17 @@ export interface WorkflowSettings {
    */
   persistAgentSessions?: boolean;
   /**
+   * Route UNTAGGED agent() calls (no `model`, no `tier`) to the orchestrating
+   * session's main model instead of the implicit medium tier (when
+   * configured) or the settings default. Default false (legacy routing).
+   * Explicit `model`/`tier` tags are unaffected. Applies when the session has
+   * a main model; with none set, legacy routing applies. The inherited model
+   * is the main model in effect when the RUN starts; a mid-run /model switch
+   * applies to subsequent runs. An unavailable inherited model degrades to
+   * the settings default with a run-visible warning instead of throwing.
+   */
+  inheritMainModel?: boolean;
+  /**
    * Character cap on a delivered background-run result's JSON-dump fallback
    * before truncation (default 400). String results and `verdict`/`report`/
    * `summary`/`synthesis` fields are never truncated.
@@ -49,6 +65,12 @@ export interface WorkflowSettings {
    * tool) so a subagent can't fan out through them.
    */
   excludeSubagentTools?: string[];
+  /**
+   * Trusted provider/auth middleware extension names allowed in child sessions.
+   * Omitted or [] loads no host extensions. Recursive workflow/subagent
+   * extensions are always excluded.
+   */
+  providerMiddlewareExtensions?: string[];
 }
 
 export interface WorkflowSettingsStore {
@@ -63,6 +85,8 @@ export interface WorkflowSettingsOptions {
   cwd?: string;
   /** Explicit project settings path, primarily for tests. */
   projectSettingsPath?: string;
+  /** Explicit project-local (in-repo) settings path, primarily for tests. */
+  projectLocalSettingsPath?: string;
   /** Save destination when using saveWorkflowSettings with cwd. Default: global. */
   scope?: "global" | "project";
 }
@@ -77,14 +101,35 @@ export function getWorkflowProjectSettingsPath(cwd: string): string {
   return workflowProjectPaths(cwd).settingsPath;
 }
 
-/** Load settings from disk. Missing, corrupt, or invalid files resolve to {}. */
+/**
+ * Path to the project-local (in-repo) workflow settings file
+ * (`<cwd>/.pi/workflows/settings.json`). Lets a repository or its tooling ship
+ * workflow defaults with the project, the same way project-local
+ * `.pi/workflows/saved/` ships saved workflows.
+ */
+export function getProjectLocalWorkflowSettingsPath(cwd: string): string {
+  return resolve(cwd, WORKFLOW_SETTINGS_FILE);
+}
+
+/**
+ * Load settings from disk. Missing, corrupt, or invalid files resolve to {}.
+ * Precedence when a cwd is provided (later wins): global user settings, then
+ * the project-local in-repo file (`<cwd>/.pi/workflows/settings.json`), then
+ * the per-project override under `~/.pi/workflows/projects/<key>/` — so a
+ * repo can ship defaults while a user's own project override still wins.
+ */
 export function loadWorkflowSettings(settingsPathOrOptions?: string | WorkflowSettingsOptions): WorkflowSettings {
   const options = normalizeOptions(settingsPathOrOptions);
   const globalSettings = readSettings(options.settingsPath ?? getWorkflowSettingsPath());
+  const projectLocalPath =
+    options.projectLocalSettingsPath ?? (options.cwd ? getProjectLocalWorkflowSettingsPath(options.cwd) : undefined);
   const projectPath =
     options.projectSettingsPath ?? (options.cwd ? getWorkflowProjectSettingsPath(options.cwd) : undefined);
-  if (!projectPath) return globalSettings;
-  return { ...globalSettings, ...readSettings(projectPath) };
+  return {
+    ...globalSettings,
+    ...(projectLocalPath ? readSettings(projectLocalPath) : {}),
+    ...(projectPath ? readSettings(projectPath) : {}),
+  };
 }
 
 /** Merge known settings into the user-level settings file. */
@@ -137,6 +182,9 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   }
   const keywordTriggerWord = normalizeKeywordTriggerWord(raw.keywordTriggerWord);
   if (keywordTriggerWord !== undefined) settings.keywordTriggerWord = keywordTriggerWord;
+  if (raw.defaultEffort === "off" || raw.defaultEffort === "high" || raw.defaultEffort === "ultra") {
+    settings.defaultEffort = raw.defaultEffort;
+  }
   if (raw.defaultAgentTimeoutMs === null) {
     settings.defaultAgentTimeoutMs = null;
   } else if (
@@ -169,11 +217,19 @@ function normalizeSettings(value: unknown): WorkflowSettings {
   if (typeof raw.persistAgentSessions === "boolean") {
     settings.persistAgentSessions = raw.persistAgentSessions;
   }
+  if (typeof raw.inheritMainModel === "boolean") {
+    settings.inheritMainModel = raw.inheritMainModel;
+  }
   const deliveredResultMaxChars = normalizeInteger(raw.deliveredResultMaxChars, 1, 1_000_000);
   if (deliveredResultMaxChars !== undefined) settings.deliveredResultMaxChars = deliveredResultMaxChars;
   if (Array.isArray(raw.excludeSubagentTools)) {
     const names = raw.excludeSubagentTools.filter((t): t is string => typeof t === "string" && t.trim().length > 0);
     if (names.length) settings.excludeSubagentTools = names;
+  }
+  if (Array.isArray(raw.providerMiddlewareExtensions)) {
+    settings.providerMiddlewareExtensions = raw.providerMiddlewareExtensions
+      .filter((name): name is string => typeof name === "string" && name.trim().length > 0)
+      .map((name) => name.trim());
   }
   return settings;
 }

@@ -1,7 +1,12 @@
 export type { AdversarialReviewConfig } from "./adversarial-review.js";
 export { generateAdversarialReviewWorkflow, generateMultiPerspectiveWorkflow } from "./adversarial-review.js";
 export type { AgentRunOptions, AgentRunResult, WorkflowAgentOptions } from "./agent.js";
-export { listAvailableModelSpecs, listAvailableModels, WorkflowAgent } from "./agent.js";
+export {
+  DEFAULT_PROVIDER_MIDDLEWARE_EXTENSIONS,
+  listAvailableModelSpecs,
+  listAvailableModels,
+  WorkflowAgent,
+} from "./agent.js";
 export type { AgentHistoryEntry, AgentHistoryKind, AgentHistoryRole } from "./agent-history.js";
 export { compactAgentHistory } from "./agent-history.js";
 export type { AgentDefinition, AgentRegistry } from "./agent-registry.js";
@@ -56,17 +61,31 @@ export {
   splitModelSpecThinking,
   THINKING_LEVELS,
 } from "./model-spec.js";
-export type { ModelTierConfig, RankableModel } from "./model-tier-config.js";
+export type { ModelTierConfig, ModelTierConfigOptions, RankableModel } from "./model-tier-config.js";
 export {
   buildDefaultTierConfig,
   formatTierFallbackNotice,
   getModelTierConfigPath,
+  getProjectModelTierConfigPath,
   loadModelTierConfig,
   resolveTierModel,
   saveModelTierConfig,
   sortedTierNames,
 } from "./model-tier-config.js";
-export type { PendingDeliveryMarker, PersistedRunState, RunPersistence, RunStatus } from "./run-persistence.js";
+export type {
+  ModelSource,
+  PreSpawnModelContext,
+  PreSpawnModelDecision,
+  PreSpawnModelResolver,
+} from "./pre-spawn-model.js";
+export { getPreSpawnModelResolver, setPreSpawnModelResolver } from "./pre-spawn-model.js";
+export type {
+  PendingDeliveryMarker,
+  PersistedAgentState,
+  PersistedRunState,
+  RunPersistence,
+  RunStatus,
+} from "./run-persistence.js";
 export { createRunPersistence, generateRunId } from "./run-persistence.js";
 export {
   parseCommandArgs,
@@ -87,6 +106,8 @@ export {
   suspendResultDelivery,
   suspendSessionDelivery,
   type TaskPanelOptions,
+  WORKFLOW_LIFECYCLE_EVENT,
+  type WorkflowLifecycleEvent,
 } from "./task-panel.js";
 export type {
   AutoResumeDelayParams,
@@ -100,6 +121,8 @@ export type {
   AgentOptions,
   JournalEntry,
   SharedRuntime,
+  WorkflowCheckpoint,
+  WorkflowCheckpointInput,
   WorkflowMeta,
   WorkflowMetaPhase,
   WorkflowRunOptions,
@@ -150,7 +173,7 @@ export {
   registerWorkflowTriggerCommand,
   type WorkflowModeState,
 } from "./workflow-editor.js";
-export type { ManagedRun, WorkflowManagerOptions } from "./workflow-manager.js";
+export type { ManagedRun, WorkflowManagerOptions, WorkflowResumeOptions } from "./workflow-manager.js";
 export { WorkflowManager } from "./workflow-manager.js";
 export type { WorkflowProjectPaths } from "./workflow-paths.js";
 export {
@@ -162,9 +185,15 @@ export {
   workflowUserSavedDir,
 } from "./workflow-paths.js";
 export type { SavedWorkflow, WorkflowStorage } from "./workflow-saved.js";
-export { assertSafeSavedWorkflowName, createWorkflowStorage, isSafeSavedWorkflowName } from "./workflow-saved.js";
+export {
+  assertSafeSavedWorkflowName,
+  createWorkflowStorage,
+  isSafeSavedWorkflowName,
+  resolveSavedScriptPath,
+} from "./workflow-saved.js";
 export type { WorkflowSettings, WorkflowSettingsOptions, WorkflowSettingsStore } from "./workflow-settings.js";
 export {
+  getProjectLocalWorkflowSettingsPath,
   getWorkflowProjectSettingsPath,
   getWorkflowSettingsPath,
   loadWorkflowSettings,
@@ -183,5 +212,5 @@ export {
   type ViewKind,
 } from "./workflow-ui.js";
 export { registerWorkflowModelsCommand } from "./workflows-models-command.js";
-export type { Worktree } from "./worktree.js";
+export type { Worktree, WorktreeExecOptions } from "./worktree.js";
 export { createWorktree, removeWorktree } from "./worktree.js";

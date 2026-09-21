@@ -7,13 +7,23 @@ import {
   readFileSync,
   rmSync,
   type statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { WORKFLOW_RUNS_DIR } from "../src/config.js";
-import { createRunPersistence, generateRunId, type PersistedRunState } from "../src/run-persistence.js";
+import { WorkflowErrorCode } from "../src/errors.js";
+import {
+  createRunPersistence,
+  generateRunId,
+  INTERRUPTED_AGENT_CAUSE,
+  type PersistedAgentState,
+  type PersistedRunState,
+  settleInterruptedPersistedAgents,
+  settleNonTerminalPersistedAgents,
+} from "../src/run-persistence.js";
 import { WorkflowManager } from "../src/workflow-manager.js";
 import { workflowProjectPaths } from "../src/workflow-paths.js";
 import { withFakeHomeAsync } from "./helpers/fake-home.js";
@@ -147,7 +157,9 @@ test(
       }),
     );
 
-    assert.equal(rp.load("legacy-run")?.workflowName, "legacy");
+    const loaded = rp.load("legacy-run");
+    assert.equal(loaded?.workflowName, "legacy");
+    assert.equal(loaded?.parentSessionFile, undefined, "legacy files without lineage fields still load");
     assert.equal(
       rp.list().some((run) => run.runId === "legacy-run"),
       true,
@@ -309,7 +321,13 @@ test(
       agents: [],
       logs: [],
       journal: [
-        { index: 0, hash: "abc123", result: { ok: true } },
+        {
+          index: 0,
+          callId: "journal-test:0",
+          hash: "abc123",
+          result: { ok: true },
+          storeDelta: { answer: 42 },
+        },
         { index: 1, hash: "def456", result: { value: 42 } },
       ],
       startedAt: "2024-01-01T00:00:00.000Z",
@@ -319,8 +337,10 @@ test(
     const loaded = rp.load("journal-test");
     assert.equal(loaded?.journal?.length, 2);
     assert.equal(loaded?.journal?.[0].index, 0);
+    assert.equal(loaded?.journal?.[0].callId, "journal-test:0");
     assert.equal(loaded?.journal?.[0].hash, "abc123");
     assert.deepEqual(loaded?.journal?.[0].result, { ok: true });
+    assert.deepEqual(loaded?.journal?.[0].storeDelta, { answer: 42 });
   }),
 );
 
@@ -367,6 +387,67 @@ test(
     assert.equal(loaded?.durationMs, 60000);
   }),
 );
+
+test(
+  "createRunPersistence save and load preserves terminal error and errorCode",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "failed-cause",
+      workflowName: "wf",
+      script: "export const meta = { name: 'w', description: 'w' }",
+      status: "failed",
+      error: "script failed",
+      errorCode: WorkflowErrorCode.AGENT_EXECUTION_ERROR,
+      phases: [],
+      agents: [],
+      logs: [],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+    const loaded = rp.load("failed-cause");
+    assert.equal(loaded?.error, "script failed");
+    assert.equal(loaded?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  }),
+);
+
+test("settleNonTerminalPersistedAgents skips leftover running/queued agents on abort", () => {
+  const agents: PersistedAgentState[] = [
+    { id: 1, label: "done", prompt: "a", status: "done", endedAt: "2024-01-01T00:00:01.000Z" },
+    { id: 2, label: "hang", prompt: "b", status: "running", startedAt: "2024-01-01T00:00:02.000Z" },
+    { id: 3, label: "wait", prompt: "c", status: "queued" },
+    { id: 4, label: "err", prompt: "d", status: "error", error: "boom" },
+  ];
+  const settled = settleNonTerminalPersistedAgents(
+    agents,
+    "aborted",
+    { message: "workflow aborted", code: WorkflowErrorCode.WORKFLOW_ABORTED },
+    "2024-01-01T00:00:10.000Z",
+  );
+  assert.equal(settled[0]?.status, "done");
+  assert.equal(settled[1]?.status, "skipped");
+  assert.equal(settled[1]?.error, "aborted");
+  assert.equal(settled[1]?.errorCode, WorkflowErrorCode.WORKFLOW_ABORTED);
+  assert.equal(settled[1]?.endedAt, "2024-01-01T00:00:10.000Z");
+  assert.equal(settled[2]?.status, "skipped");
+  assert.equal(settled[3]?.status, "error");
+  assert.equal(settled[3]?.error, "boom");
+});
+
+test("settleNonTerminalPersistedAgents is a no-op for paused runs", () => {
+  const agents: PersistedAgentState[] = [{ id: 1, label: "hang", prompt: "b", status: "running" }];
+  const settled = settleNonTerminalPersistedAgents(agents, "paused", undefined, "2024-01-01T00:00:10.000Z");
+  assert.equal(settled[0]?.status, "running");
+  assert.equal(settled[0]?.error, undefined);
+});
+
+test("settleInterruptedPersistedAgents skips leftover agents regardless of run status", () => {
+  const agents: PersistedAgentState[] = [{ id: 1, label: "hang", prompt: "b", status: "running" }];
+  const settled = settleInterruptedPersistedAgents(agents, INTERRUPTED_AGENT_CAUSE, "2024-01-01T00:00:10.000Z");
+  assert.equal(settled[0]?.status, "skipped");
+  assert.equal(settled[0]?.error, "interrupted");
+  assert.equal(settled[0]?.endedAt, "2024-01-01T00:00:10.000Z");
+});
 
 test("generateRunId returns a string with timestamp and random parts", () => {
   const id = generateRunId();
@@ -567,7 +648,7 @@ test(
 );
 
 test(
-  "createRunPersistence list() re-reads disk again once the TTL has elapsed (not cached forever)",
+  "createRunPersistence list() skips unchanged directory scans but reconciles external edits",
   withTempCwd(async (cwd) => {
     let readdirCalls = 0;
     const rp = createRunPersistence(cwd, {
@@ -582,12 +663,17 @@ test(
     rp.list();
     assert.equal(readdirCalls, 1);
 
-    // Wait past the TTL window (well beyond any reasonable short cache) and
-    // confirm a later call does read disk again — this is a cache, not a
-    // permanent snapshot.
     await new Promise((r) => setTimeout(r, 400));
     rp.list();
-    assert.ok(readdirCalls >= 2, "list() should read disk again once the TTL has elapsed");
+    assert.equal(readdirCalls, 1, "unchanged directories do not require per-run stat calls");
+    const originalNow = Date.now;
+    try {
+      Date.now = () => originalNow() + 6000;
+      rp.list();
+      assert.ok(readdirCalls >= 2, "in-place external edits are periodically reconciled");
+    } finally {
+      Date.now = originalNow;
+    }
   }),
 );
 
@@ -689,7 +775,7 @@ test(
 );
 
 test(
-  "createRunPersistence retention: terminal runs beyond the cap are evicted oldest-first; running/paused survive purely because of the status filter, not save order",
+  "createRunPersistence retention keeps active and undelivered runs while evicting the oldest delivered terminals",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd, undefined, { maxTerminalRunsOnDisk: 3 });
 
@@ -704,8 +790,12 @@ test(
     // masking whether the status filter does anything at all.
     rp.save(baseRunState("still-running", "2023-01-01T00:00:00.000Z", "running"));
     rp.save(baseRunState("still-paused", "2023-01-01T00:00:00.000Z", "paused"));
+    rp.save({
+      ...baseRunState("still-pending", "2023-01-01T00:00:00.000Z", "completed"),
+      pendingDelivery: { kind: "complete" },
+    });
 
-    // Now enough terminal runs (saved after, so newer) to exceed the cap.
+    // Now enough delivered terminal runs (saved after, so newer) to exceed the cap.
     for (let i = 0; i < 5; i++) {
       rp.save(baseRunState(`terminal-${i}`, `2024-01-0${i + 1}T00:00:00.000Z`, "completed"));
     }
@@ -726,6 +816,7 @@ test(
       runIds.includes("still-paused"),
       "a paused run survives even though it has the OLDEST updatedAt of everything saved here",
     );
+    assert.ok(runIds.includes("still-pending"), "an undelivered terminal run is not evicted");
     assert.equal(rp.load("terminal-0"), null, "an evicted run's file is actually gone from disk");
   }),
 );
@@ -980,6 +1071,53 @@ test(
 );
 
 test(
+  "delete removes primary and legacy recovery records before releasing either lock",
+  withTempCwd(async (cwd) => {
+    const runId = "delete-lock-last";
+    let rp!: ReturnType<typeof createRunPersistence>;
+    const recordsVisibleWhenLockReleased: Array<{ path: string; record: PersistedRunState | null }> = [];
+    rp = createRunPersistence(cwd, {
+      unlinkSync(path) {
+        const file = String(path);
+        if (file.endsWith(`${runId}.lock`)) {
+          recordsVisibleWhenLockReleased.push({ path: file, record: rp.load(runId) });
+        }
+        unlinkSync(path);
+      },
+    });
+    const state = {
+      runId,
+      workflowName: "w",
+      status: "paused",
+      phases: [],
+      agents: [],
+      logs: [],
+    } as PersistedRunState;
+    rp.save(state);
+
+    const { runsDir, legacyRunsDir } = workflowProjectPaths(cwd);
+    mkdirSync(legacyRunsDir, { recursive: true });
+    for (const path of [
+      join(runsDir, `${runId}.json.tmp`),
+      join(legacyRunsDir, `${runId}.json`),
+      join(legacyRunsDir, `${runId}.json.bak`),
+      join(legacyRunsDir, `${runId}.json.tmp`),
+    ]) {
+      writeFileSync(path, JSON.stringify(state));
+    }
+    const lease = rp.acquireRunLease(runId);
+    assert.ok(lease, "primary lock exists before delete");
+    writeFileSync(join(legacyRunsDir, `${runId}.lock`), "legacy lock");
+
+    assert.equal(rp.delete(runId), true);
+    assert.equal(recordsVisibleWhenLockReleased.length, 2, "both primary and legacy locks are released last");
+    for (const observed of recordsVisibleWhenLockReleased) {
+      assert.equal(observed.record, null, `${observed.path} is released only after no run record is loadable`);
+    }
+  }),
+);
+
+test(
   "WorkflowManager reconciles a stale 'running' run to 'paused' on construction",
   withTempCwd(async (cwd) => {
     const rp = createRunPersistence(cwd);
@@ -989,12 +1127,40 @@ test(
       status: "running",
       script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
       phases: [],
-      agents: [],
+      agents: [{ id: 1, label: "x", prompt: "x", status: "running" }],
       logs: [],
     } as PersistedRunState);
     // A fresh manager (the previous process died) should recover the orphan.
     new WorkflowManager({ cwd });
-    assert.equal(rp.load("stale")?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    const recovered = rp.load("stale");
+    assert.equal(recovered?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    assert.equal(recovered?.agents[0]?.status, "skipped", "orphaned in-flight agents cannot still be running");
+    assert.equal(recovered?.agents[0]?.error, "interrupted");
+  }),
+);
+
+test(
+  "WorkflowManager settles leftover running agents on an orphaned paused run",
+  withTempCwd(async (cwd) => {
+    const rp = createRunPersistence(cwd);
+    rp.save({
+      runId: "paused-ghost",
+      workflowName: "w",
+      status: "paused",
+      script: "export const meta = { name: 'w', description: 'd' }\nawait agent('x',{label:'x'})\nreturn 1",
+      phases: [],
+      agents: [{ id: 1, label: "x", prompt: "x", status: "running" }],
+      logs: ["still going"],
+      startedAt: "2024-01-01T00:00:00.000Z",
+      updatedAt: "2024-01-01T00:00:00.000Z",
+    });
+    new WorkflowManager({ cwd });
+    const recovered = rp.load("paused-ghost");
+    assert.equal(recovered?.status, "paused");
+    assert.equal(recovered?.agents[0]?.status, "skipped");
+    assert.equal(recovered?.agents[0]?.error, "interrupted");
+    assert.ok(recovered?.agents[0]?.endedAt);
+    assert.deepEqual(recovered?.logs, ["still going"]);
   }),
 );
 
@@ -1102,7 +1268,12 @@ test(
 const a = await agent('hi', { label: 'a' })
 return a`;
 
-    const m = new WorkflowManager({ cwd, sessionId: "session-A", agent: deferredAgent() });
+    const m = new WorkflowManager({
+      cwd,
+      sessionId: "session-A",
+      sessionFile: "/sessions/session-A.jsonl",
+      agent: deferredAgent(),
+    });
     m.on("error", () => {});
     const { runId } = m.startInBackground(script);
     await new Promise((r) => setTimeout(r, 30));
@@ -1110,15 +1281,23 @@ return a`;
     const live = m.getRun(runId);
     assert.ok(live);
     assert.equal(live.sessionId, "session-A", "frozen at start");
+    assert.equal(live.parentSessionId, "session-A", "parent id is frozen at start");
+    assert.equal(live.parentSessionFile, "/sessions/session-A.jsonl", "parent file is frozen at start");
     assert.deepEqual(
       m.listRuns().map((r) => r.runId),
       [runId],
     );
 
     // Switch the manager's bound session the way session_start does after /new.
-    m.setSessionId("session-B");
+    m.setSessionId("session-B", "/sessions/session-B.jsonl");
     assert.equal(m.listRuns().length, 0, "without adopt, the new session's filtered view hides the still-A-owned run");
     assert.equal(m.getRun(runId)?.sessionId, "session-A", "setSessionId must not mutate the live run");
+    assert.equal(m.getRun(runId)?.parentSessionId, "session-A", "session replacement must not change parent id");
+    assert.equal(
+      m.getRun(runId)?.parentSessionFile,
+      "/sessions/session-A.jsonl",
+      "session replacement must not change parent file",
+    );
     assert.deepEqual(
       m
         .listLiveRuns()
@@ -1132,9 +1311,16 @@ return a`;
     assert.equal(m.getRun(runId)?.status, "paused");
     // Persisted owner must still be A (pause writes managed.sessionId, not this.sessionId).
     assert.equal(m.getPersistence().load(runId)?.sessionId, "session-A");
+    assert.equal(m.getPersistence().load(runId)?.parentSessionId, "session-A");
+    assert.equal(m.getPersistence().load(runId)?.parentSessionFile, "/sessions/session-A.jsonl");
 
     // Fresh manager: start under A, switch to B, adopt — panel must see it under B.
-    const m2 = new WorkflowManager({ cwd, sessionId: "session-A", agent: deferredAgent() });
+    const m2 = new WorkflowManager({
+      cwd,
+      sessionId: "session-A",
+      sessionFile: "/sessions/session-A.jsonl",
+      agent: deferredAgent(),
+    });
     m2.on("error", () => {});
     const { runId: run2 } = m2.startInBackground(script);
     await new Promise((r) => setTimeout(r, 30));
@@ -1143,6 +1329,8 @@ return a`;
     const adopted = m2.adoptLiveRunsToSession("session-B");
     assert.equal(adopted, 1);
     assert.equal(m2.getRun(run2)?.sessionId, "session-B");
+    assert.equal(m2.getRun(run2)?.parentSessionId, "session-A");
+    assert.equal(m2.getRun(run2)?.parentSessionFile, "/sessions/session-A.jsonl");
     assert.deepEqual(
       m2.listRuns().map((r) => r.runId),
       [run2],

@@ -13,6 +13,7 @@
 
 import assert from "node:assert/strict";
 import { describe, it, mock } from "node:test";
+import { aggregateAgentUsage, fmtFull, fmtTokenSegment, tokenFigures } from "../src/display.js";
 import type { WorkflowMeta } from "../src/workflow.js";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -127,6 +128,16 @@ describe("renderWorkflowText", () => {
     assert.ok(text.includes("1 errors"), "should show error count");
   });
 
+  it("maxAgents: 0 falls back to the default cap instead of rendering ALL agents (audit2 #31)", async () => {
+    const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
+    const snap = recomputeWorkflowSnapshot(createWorkflowSnapshot(fakeMeta()));
+    snap.agents = Array.from({ length: 12 }, (_, i) => agent(i + 1, `a${i + 1}`, "done", "Research")) as never[];
+    const text = renderWorkflowLines(recomputeWorkflowSnapshot(snap), { maxAgents: 0 }).join("\n");
+    // slice(-0) === slice(0) would render all 12; the fallback caps at 8.
+    assert.ok(!text.includes("a1") || text.includes("earlier agents"), "the cap applies");
+    assert.ok(text.includes("earlier agents"), "truncation note rendered");
+  });
+
   it("shows running count in header", async () => {
     const { createWorkflowSnapshot, renderWorkflowLines, recomputeWorkflowSnapshot } = await loadDisplay();
     const snap = recomputeWorkflowSnapshot(createWorkflowSnapshot(fakeMeta()));
@@ -202,30 +213,35 @@ describe("renderWorkflowText", () => {
     assert.deepEqual(tokenFigures({ input: 80, output: 20, total: 1100, cacheRead: 900, cacheWrite: 100 }), {
       fresh: 200,
       cacheRead: 900,
+      estimated: false,
     });
     // Cache-creating first turn: the written prefix must not vanish from the count.
     assert.deepEqual(tokenFigures({ input: 6000, output: 1000, total: 207000, cacheRead: 0, cacheWrite: 200000 }), {
       fresh: 207000,
       cacheRead: 0,
+      estimated: false,
     });
     // Estimate-only (provider reported nothing): the scalar total survives as fresh.
     assert.deepEqual(tokenFigures({ input: 0, output: 0, total: 800, cacheRead: 0, cacheWrite: 0 }), {
       fresh: 800,
       cacheRead: 0,
+      estimated: false,
     });
     // Cost-only agent: all-zero breakdown, scalar estimate alongside.
     assert.deepEqual(tokenFigures({ input: 0, output: 0, total: 0, cacheRead: 0, cacheWrite: 0, cost: 0.02 }, 384), {
       fresh: 384,
       cacheRead: 0,
+      estimated: false,
     });
     // Mixed run: some agents reported (input+output=100), the rest only estimated into total.
     assert.deepEqual(tokenFigures({ input: 70, output: 30, total: 900, cacheRead: 0, cacheWrite: 0 }), {
       fresh: 900,
       cacheRead: 0,
+      estimated: false,
     });
     // No usage object at all.
-    assert.deepEqual(tokenFigures(undefined, 500), { fresh: 500, cacheRead: 0 });
-    assert.deepEqual(tokenFigures(undefined), { fresh: 0, cacheRead: 0 });
+    assert.deepEqual(tokenFigures(undefined, 500), { fresh: 500, cacheRead: 0, estimated: false });
+    assert.deepEqual(tokenFigures(undefined), { fresh: 0, cacheRead: 0, estimated: false });
   });
 
   it("header falls back to the estimated total when the provider reported no usage (#57 regression)", async () => {
@@ -932,5 +948,45 @@ describe("TUI rendering has no markdown syntax", () => {
     assert.doesNotThrow(() => {
       tool.renderResult(resultWithMarkdown as never, { isPartial: false }, theme as never);
     });
+  });
+});
+
+describe("fmtTokenSegment estimate marking (#209)", () => {
+  it("prefixes character-heuristic figures with ~ so an estimate never reads as metered", () => {
+    assert.equal(fmtTokenSegment({ fresh: 1200, cacheRead: 0, estimated: true }, fmtFull), "~1,200 tok");
+    assert.equal(fmtTokenSegment({ fresh: 1200, cacheRead: 300, estimated: true }, fmtFull), "~1,200 tok · 300 cached");
+    assert.equal(
+      fmtTokenSegment({ fresh: 1200, cacheRead: 0, estimated: false }, fmtFull),
+      "1,200 tok",
+      "metered figures render unprefixed",
+    );
+    assert.equal(
+      fmtTokenSegment({ fresh: 0, cacheRead: 0, estimated: true }, fmtFull),
+      "",
+      "nothing-known stays omitted",
+    );
+  });
+
+  it("keeps legacy callers without estimated as metered output", () => {
+    const rendered = fmtTokenSegment({ fresh: 1200, cacheRead: 0 }, fmtFull);
+    assert.equal(rendered, "1,200 tok");
+    assert.doesNotMatch(rendered, /~/);
+  });
+
+  it("tokenFigures and aggregateAgentUsage propagate the flag", () => {
+    assert.deepEqual(tokenFigures({ input: 10, output: 5, total: 15, estimated: true }), {
+      fresh: 15,
+      cacheRead: 0,
+      estimated: true,
+    });
+    assert.equal(tokenFigures({ input: 10, output: 5, total: 15 }).estimated, false);
+    const aggregate = aggregateAgentUsage([
+      { tokens: 10, tokenUsage: undefined },
+      {
+        tokens: 5,
+        tokenUsage: { input: 0, output: 5, cacheRead: 0, cacheWrite: 0, total: 5, cost: 0, estimated: true },
+      },
+    ]);
+    assert.equal(aggregate.estimated, true, "one estimated agent flags the phase aggregate");
   });
 });

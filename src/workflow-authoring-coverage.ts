@@ -33,11 +33,11 @@ export const WORKFLOW_COMPREHENSION_SCENARIO_IDS = COMPREHENSION_SCENARIOS.map((
 export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   {
     path: "skills/workflow-authoring/SKILL.md",
-    sha256: "44f68f4302c278ac998dbcd43b3b8a2041087dfdc6adf81f96e24c85194243c4",
+    sha256: "06648fc0a151e70ab73aede271522e400c6cd08e665cd15680603235de7cf64f",
   },
   {
     path: "skills/workflow-authoring/references/runtime.md",
-    sha256: "5eb9d6f9b7f5403f84cdb2f9e06a0926d87b6292eb01ce5e4ae533393c0b173f",
+    sha256: "a602af4fc6ebfeeab7ab9e089968864226bd37c85789f08508c73655595f1988",
   },
   {
     path: "skills/workflow-authoring/references/helpers.md",
@@ -45,11 +45,11 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/specialized-helpers.md",
-    sha256: "7597c94bbacea885697fb2d05a96ed9ec39403ca6d3a94547bf8ce5e233b2c76",
+    sha256: "ef95cc7fb9c68e55cb64cc7f63814df4059dbffa6c3d06f63f13d21819c4b863",
   },
   {
     path: "skills/workflow-authoring/references/lifecycle.md",
-    sha256: "04a07ddbc03ac7b4452e4bea82418000ff84e429c4a3de602fbc47abaaae8843",
+    sha256: "c3dfac1d2b0505f361f515fb21a5c55e0f97ca9d57bf7dc57eedcaab9500c580",
   },
   {
     path: "skills/workflow-authoring/references/pattern-selection.md",
@@ -61,7 +61,7 @@ export const WORKFLOW_AUTHORING_FROZEN_FILES = [
   },
   {
     path: "skills/workflow-authoring/references/registry-ownership.md",
-    sha256: "425babf6fa5bd24fa0adef3d9b398661ad1e933d372b3989d22fe99e63f2c7ba",
+    sha256: "1fcff2bc3077efa58e6ed4e21c84d40bdb83ed49470f455d8753d3ae5d5c28e7",
   },
   {
     path: "skills/workflow-authoring/references/review.md",
@@ -151,7 +151,7 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     {
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:
-        "`completenessCheck(args, results)` | Returns `{ complete, missing? }` or recoverable `null`. The critic sees only the first 4,000 serialized characters, so chunk or summarize larger evidence. Treat the verdict as advisory.",
+        "`completenessCheck(args, results)` | Consumes one logical agent slot and preflights that capacity before starting the critic; an external pause/stop abort wins before the critic starts. Returns `{ complete, missing? }` or recoverable `null`. The critic sees only the first 4,000 serialized characters, so chunk or summarize larger evidence. Treat the verdict as advisory.",
     },
   ],
   "workflow.runtime.gate": [
@@ -162,6 +162,11 @@ const FROZEN_GUIDANCE_BY_CAPABILITY: Readonly<Record<string, readonly ProtectedG
     },
   ],
   "workflow.runtime.checkpoint": [
+    {
+      path: SPECIALIZED_HELPERS_PATH,
+      requiredText:
+        "`checkpoint({ kind, checkpointId, payload })` | Durably suspends the run until a controller attaches a JSON response for that exact ID and resumes it. Works without foreground UI; replay returns the journaled response.",
+    },
     {
       path: SPECIALIZED_HELPERS_PATH,
       requiredText:

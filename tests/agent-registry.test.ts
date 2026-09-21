@@ -75,6 +75,21 @@ describe("parseAgentDefinition", () => {
     assert.ok(def);
     assert.equal(def.isolation, undefined);
   });
+
+  it("parses thinking from frontmatter", () => {
+    const def = parseAgentDefinition(
+      "---\nname: reviewer\nmodel: cursor/claude-opus-5@1m\nthinking: max\n---\nBody.",
+      "project",
+      "reviewer.md",
+    );
+    assert.equal(def?.model, "cursor/claude-opus-5@1m");
+    assert.equal(def?.thinking, "max");
+  });
+
+  it("ignores unknown thinking values", () => {
+    const def = parseAgentDefinition("---\nname: agent\nthinking: ultra\n---\nBody.", "project", "agent.md");
+    assert.equal(def?.thinking, undefined);
+  });
 });
 
 // ── loadAgentRegistry (dir injection) ──────────────────────────────────────
@@ -324,6 +339,7 @@ describe("agentDefinitionKey", () => {
     const base: AgentDefinition = { name: "x", prompt: "p", model: "m", tools: ["read"], source: "project" };
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, prompt: "p2" }));
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, model: "m2" }));
+    assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, thinking: "max" }));
     assert.notEqual(agentDefinitionKey(base), agentDefinitionKey({ ...base, tools: ["read", "write"] }));
   });
 
@@ -338,6 +354,7 @@ describe("agentDefinitionKey", () => {
 function capturingAgent() {
   const seen: Array<{
     model?: string;
+    thinking?: string;
     tier?: string;
     toolNames?: string[];
     disallowedToolNames?: string[];
@@ -349,6 +366,7 @@ function capturingAgent() {
     async run(_prompt: string, options: Record<string, unknown>) {
       seen.push({
         model: options.model as string | undefined,
+        thinking: options.thinking as string | undefined,
         tier: options.tier as string | undefined,
         toolNames: options.toolNames as string[] | undefined,
         disallowedToolNames: options.disallowedToolNames as string[] | undefined,
@@ -401,6 +419,19 @@ return {}`;
     assert.equal(seen[0].model, "explicit/model");
   });
 
+  it("call-site thinking overrides agentType thinking", async () => {
+    const { seen, runner } = capturingAgent();
+    const thinkingRegistry: AgentRegistry = new Map([
+      ["thinker", { name: "thinker", prompt: "think", thinking: "low", source: "project" } as AgentDefinition],
+    ]);
+    await runWorkflow(
+      `export const meta = { name: 'thinking', description: 'precedence' }
+return await agent('audit', { agentType: 'thinker', thinking: 'high' })`,
+      { agent: runner, persistLogs: false, agentRegistry: thinkingRegistry },
+    );
+    assert.equal(seen[0]?.thinking, "high");
+  });
+
   it("agentType model beats a tier (model passed, tier still forwarded)", async () => {
     const { seen, runner } = capturingAgent();
     const script = `export const meta = { name: 'at', description: 'agentType' }
@@ -446,10 +477,105 @@ return {}`;
       });
 
       assert.equal(seen.length, 1);
-      assert.ok(seen[0].cwd, "isolated agent should receive a cwd");
-      assert.notEqual(seen[0].cwd, repo, "agent cwd should not be the base repo");
+      const isolatedCwd = seen[0].cwd;
+      assert.ok(isolatedCwd, "isolated agent should receive a cwd");
+      assert.notEqual(isolatedCwd, repo, "agent cwd should not be the base repo");
       assert.equal(seen[0].cwdExists, true, "worktree cwd should exist while the agent runs");
       assert.ok(seen[0].instructions?.includes("Requested isolation: worktree"));
+      assert.equal(existsSync(isolatedCwd), true, "worktree kept after the call by default");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("isolation: false opts out of an agentType worktree default", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pi-agent-isolation-optout-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "file.txt"), "base\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "init");
+
+      const isolatedRegistry: AgentRegistry = new Map([
+        [
+          "isolated-auditor",
+          {
+            name: "isolated-auditor",
+            prompt: "Run isolated.",
+            isolation: "worktree",
+            source: "project",
+          } as AgentDefinition,
+        ],
+      ]);
+      const { seen, runner } = capturingAgent();
+      const script = `export const meta = { name: 'optout', description: 'isolation false' }
+await agent('audit', { label: 'a', agentType: 'isolated-auditor', isolation: false })
+return {}`;
+
+      await runWorkflow(script, {
+        cwd: repo,
+        runId: "iso-optout",
+        agent: runner,
+        persistLogs: false,
+        agentRegistry: isolatedRegistry,
+      });
+
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].cwd, undefined, "opt-out should not isolate cwd");
+    } finally {
+      rmSync(repo, { recursive: true, force: true });
+    }
+  });
+
+  it("keepWorktree: false deletes the isolation worktree after the call", async () => {
+    const repo = mkdtempSync(join(tmpdir(), "pi-agent-isolation-ephemeral-"));
+    const git = (...args: string[]) => execFileSync("git", ["-C", repo, ...args], { stdio: "pipe" });
+    try {
+      git("init", "-q");
+      git("config", "user.email", "t@t.t");
+      git("config", "user.name", "t");
+      writeFileSync(join(repo, "file.txt"), "base\n");
+      git("add", ".");
+      git("commit", "-q", "-m", "init");
+
+      const isolatedRegistry: AgentRegistry = new Map([
+        [
+          "isolated-auditor",
+          {
+            name: "isolated-auditor",
+            prompt: "Run isolated.",
+            isolation: "worktree",
+            source: "project",
+          } as AgentDefinition,
+        ],
+      ]);
+      const { seen, runner } = capturingAgent();
+      const logs: string[] = [];
+      const script = `export const meta = { name: 'ephemeral', description: 'keepWorktree false' }
+await agent('audit', { label: 'a', agentType: 'isolated-auditor', keepWorktree: false })
+return {}`;
+
+      await runWorkflow(script, {
+        cwd: repo,
+        runId: "iso-ephemeral",
+        agent: runner,
+        persistLogs: false,
+        agentRegistry: isolatedRegistry,
+        onLog: (m) => logs.push(m),
+      });
+
+      assert.equal(seen.length, 1);
+      const isolatedCwd = seen[0].cwd;
+      assert.ok(isolatedCwd, "isolated agent should receive a cwd");
+      assert.equal(seen[0].cwdExists, true, "worktree cwd should exist while the agent runs");
+      assert.equal(existsSync(isolatedCwd), false, "worktree removed after the call");
+      assert.equal(
+        logs.some((l) => l.startsWith("worktree kept:")),
+        false,
+      );
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

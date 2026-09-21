@@ -474,17 +474,14 @@ function validatePackage(root: string, publishableFiles: readonly string[]): Wor
   return diagnostics;
 }
 
-/** Parse publishable paths from `npm pack --dry-run --json` without trusting external JSON shapes. */
 export function parseNpmPackFilePaths(output: string): string[] {
   const parsed: unknown = JSON.parse(output);
-  if (!Array.isArray(parsed)) {
+  // npm 10 emits `[{ files }]`; npm 11 emits `{ files }`.
+  const record = Array.isArray(parsed) ? parsed[0] : parsed;
+  if (!isRecord(record) || !Array.isArray(record.files)) {
     return [];
   }
-  const first = parsed[0];
-  if (!isRecord(first) || !Array.isArray(first.files)) {
-    return [];
-  }
-  return first.files.flatMap((file: unknown) => (isRecord(file) && typeof file.path === "string" ? [file.path] : []));
+  return record.files.flatMap((file: unknown) => (isRecord(file) && typeof file.path === "string" ? [file.path] : []));
 }
 
 /** Return every model-free contract, package, documentation, and guidance alignment diagnostic. */

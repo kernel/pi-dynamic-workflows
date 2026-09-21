@@ -1,10 +1,22 @@
 import type { Api, Model } from "@earendil-works/pi-ai";
-import { modelsAreEqual } from "@earendil-works/pi-ai";
 import type { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { WorkflowError, WorkflowErrorCode } from "./errors.js";
 
 export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
 
 export type ModelThinkingLevel = (typeof THINKING_LEVELS)[number];
+
+/** Validate the separate script/SDK option without changing model-id parsing. */
+export function validateThinkingLevel(value: unknown): asserts value is ModelThinkingLevel | undefined {
+  if (value === undefined) return;
+  if (typeof value !== "string" || !(THINKING_LEVELS as readonly string[]).includes(value)) {
+    throw new WorkflowError(
+      `agent thinking must be one of: ${THINKING_LEVELS.join(", ")}`,
+      WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+      { recoverable: false },
+    );
+  }
+}
 
 export interface ResolvedModelSpec {
   requestedSpec: string;
@@ -208,7 +220,7 @@ function buildFallbackModel(provider: string, modelId: string, availableModels: 
  * the cross-check property test in tests/model-spec.test.ts, which runs both
  * implementations against the same fuzzed inputs and fails loudly the moment they
  * diverge (see that file for why we don't call pi's export directly: it requires
- * a real `ModelRuntime`, which has a private constructor pi doesn't expose a
+ * a real runtime class, which has a private constructor pi doesn't expose a
  * lightweight adapter for).
  */
 export function resolveModelSpecWithThinking(
@@ -269,7 +281,9 @@ export function resolveModelSpecWithThinking(
     // aggregator the caller actually has access to.
     if (inferredProvider && modelRegistry.hasConfiguredAuth && !modelRegistry.hasConfiguredAuth(model)) {
       const rawExactMatches = availableModels.filter(
-        (candidate) => candidate.id.toLowerCase() === requestedSpec.toLowerCase() && !modelsAreEqual(candidate, model),
+        (candidate) =>
+          candidate.id.toLowerCase() === requestedSpec.toLowerCase() &&
+          !(candidate.id === model.id && candidate.provider === model.provider),
       );
       const authenticatedRawMatches = rawExactMatches.filter((candidate) =>
         modelRegistry.hasConfiguredAuth?.(candidate),

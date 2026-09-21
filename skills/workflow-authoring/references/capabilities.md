@@ -2,7 +2,7 @@
 # Workflow capability index
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.7.0`
+Contract content / skill / extension: `3.13.0`
 
 This compact generated index covers supported runtime globals and workflow-tool inputs. For constraints, compatibility behavior, internal boundaries, and dynamic-reference ownership, follow the [exhaustive generated facts](capability-details.md).
 
@@ -11,7 +11,7 @@ This compact generated index covers supported runtime globals and workflow-tool 
 <!-- BEGIN GENERATED SUPPORTED WORKFLOW CAPABILITIES -->
 | Name | Classification | Signature | Options and defaults |
 | --- | --- | --- | --- |
-| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" (optional)<br>`thread`: string (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout; null disables)<br>`retries`: number (optional; default: run retry count) |
+| agent | runtime-global | `agent(prompt, options?) => Promise<string \| structured value \| null>` | `label`: string (optional; default: derived from phase and call count)<br>`phase`: string (optional; default: current phase)<br>`schema`: plain JSON Schema (optional)<br>`model`: string (optional)<br>`thinking`: "off" \| "minimal" \| "low" \| "medium" \| "high" \| "xhigh" \| "max" (optional)<br>`tier`: string (optional)<br>`isolation`: "worktree" \| false (optional)<br>`keepWorktree`: boolean (optional; default: true)<br>`cwd`: string (optional)<br>`thread`: string (optional)<br>`agentType`: string (optional)<br>`timeoutMs`: number \| null (optional; default: run timeout, finite ms in [1, 2^31-1]; null disables)<br>`retries`: number (optional; default: run retry count) |
 | parallel | runtime-global | `parallel(thunks) => Promise<Array<unknown \| null>>` | — |
 | pipeline | runtime-global | `pipeline(items, ...stages) => Promise<Array<unknown \| null>>` | — |
 | workflow | runtime-global | `workflow(savedName, childArgs?) => Promise<unknown>` | — |
@@ -21,7 +21,7 @@ This compact generated index covers supported runtime globals and workflow-tool 
 | completenessCheck | runtime-global | `completenessCheck(taskArgs: unknown, results: unknown) => Promise<{ complete: boolean; missing?: string[] } \| null>` | — |
 | retry | runtime-global | `retry(thunk: (attempt: number) => unknown \| Promise<unknown>, options?: { attempts?: number; until?: (result: unknown) => boolean }) => Promise<unknown>` | `attempts`: number (optional; default: 3)<br>`until`: (result: unknown) => boolean (optional; default: accept first result when omitted) |
 | gate | runtime-global | `gate(thunk: (feedback: string \| undefined, attempt: number) => unknown \| Promise<unknown>, validator: (value: unknown) => { ok: boolean; feedback?: string } \| Promise<{ ok: boolean; feedback?: string }>, options?: { attempts?: number }) => Promise<{ ok: boolean; value: unknown; attempts: number }>` | `attempts`: number (optional; default: 3) |
-| checkpoint | runtime-global | `checkpoint(prompt, options?) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
+| checkpoint | runtime-global | `checkpoint(prompt, options?) \| checkpoint({ kind, checkpointId, payload }) => Promise<unknown>` | `default`: unknown (optional; default: true when no UI and omitted)<br>`headless`: "default" \| "abort" (optional; default: "default")<br>`kind`: "confirm" \| "input" \| "select" (optional; default: "confirm")<br>`choices`: string[] (optional)<br>`timeoutMs`: number (optional) |
 | log | runtime-global | `log(message) => void` | — |
 | phase | runtime-global | `phase(title, options?) => void` | `budget`: number (optional) |
 | args | runtime-global | `args: unknown` | — |

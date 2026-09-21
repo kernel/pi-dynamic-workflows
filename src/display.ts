@@ -27,6 +27,10 @@ export interface WorkflowAgentSnapshot {
   tokenUsage?: AgentUsage;
   /** The model this agent ran on (provider/id), when known. */
   model?: string;
+  /** Child SessionManager identity, captured before the first prompt. */
+  sessionId?: string;
+  /** Child session file, absent for in-memory child sessions. */
+  sessionFile?: string;
 }
 
 export interface WorkflowSnapshot {
@@ -49,6 +53,8 @@ export interface WorkflowSnapshot {
     cost?: number;
     cacheRead?: number;
     cacheWrite?: number;
+    /** True when the totals include character-heuristic estimates (#209). */
+    estimated?: boolean;
   };
   runId?: string;
 }
@@ -84,26 +90,29 @@ export interface WorkflowDisplayOptions {
 export function tokenFigures(
   usage: Partial<AgentUsage> | undefined,
   scalarTokens?: number,
-): { fresh: number; cacheRead: number } {
+): { fresh: number; cacheRead: number; estimated: boolean } {
   const cacheRead = usage?.cacheRead ?? 0;
   const reported = (usage?.input ?? 0) + (usage?.output ?? 0) + (usage?.cacheWrite ?? 0);
   const estimate = Math.max(scalarTokens ?? 0, usage?.total ?? 0);
-  return { fresh: Math.max(reported, estimate - cacheRead), cacheRead };
+  return { fresh: Math.max(reported, estimate - cacheRead), cacheRead, estimated: usage?.estimated === true };
 }
 
 /** Sum a set of agents into fresh vs cacheRead totals, via {@link tokenFigures}. */
 export function aggregateAgentUsage(agents: ReadonlyArray<Pick<WorkflowAgentSnapshot, "tokens" | "tokenUsage">>): {
   fresh: number;
   cacheRead: number;
+  estimated: boolean;
 } {
   let fresh = 0;
   let cacheRead = 0;
+  let estimated = false;
   for (const a of agents) {
     const f = tokenFigures(a.tokenUsage, a.tokens);
     fresh += f.fresh;
     cacheRead += f.cacheRead;
+    if (f.estimated) estimated = true;
   }
-  return { fresh, cacheRead };
+  return { fresh, cacheRead, estimated };
 }
 
 /**
@@ -123,10 +132,21 @@ export function fmtTokenCount(fresh: number, cacheRead: number, fmt: (n: number)
  * Like {@link fmtTokenCount}, but "" when nothing is known yet (both figures 0),
  * so surfaces omit the segment instead of rendering a false "0 tok" — e.g. for a
  * journal-replayed resume or a run whose agents were all skipped. Every surface
- * should use this rather than re-implementing the zero guard.
+ * should use this rather than re-implementing the zero guard. When
+ * `figures.estimated` is set the segment is prefixed with `~` (#209) so a
+ * heuristic-derived total never renders as metered. The marker covers the whole
+ * segment (fresh + cached) even when only one component is heuristic —
+ * conservative by design.
  */
-export function fmtTokenSegment(figures: { fresh: number; cacheRead: number }, fmt: (n: number) => string): string {
-  return figures.fresh + figures.cacheRead > 0 ? fmtTokenCount(figures.fresh, figures.cacheRead, fmt) : "";
+export function fmtTokenSegment(
+  figures: { fresh: number; cacheRead: number; estimated?: boolean },
+  fmt: (n: number) => string,
+): string {
+  if (figures.fresh + figures.cacheRead <= 0) return "";
+  const rendered = fmtTokenCount(figures.fresh, figures.cacheRead, fmt);
+  // "~" marks character-heuristic figures so an estimate never reads as a
+  // metered total (#209).
+  return figures.estimated ? `~${rendered}` : rendered;
 }
 
 /**
@@ -139,7 +159,10 @@ export function fmtCost(cost: number): string {
 }
 
 /** Full (non-compact) number style for print/text surfaces: locale-grouped digits. */
-export const fmtFull = (n: number): string => n.toLocaleString();
+// Reuse one formatter across render calls. No locale argument means the
+// runtime default, matching toLocaleString() semantics.
+const FULL_NUMBER_FORMAT = new Intl.NumberFormat();
+export const fmtFull = (n: number): string => FULL_NUMBER_FORMAT.format(n);
 
 export function createWorkflowSnapshot(meta: WorkflowMeta): WorkflowSnapshot {
   return {
@@ -160,6 +183,57 @@ export function recomputeWorkflowSnapshot(snapshot: WorkflowSnapshot): WorkflowS
   const doneCount = snapshot.agents.filter((agent) => agent.status === "done").length;
   const errorCount = snapshot.agents.filter((agent) => agent.status === "error").length;
   return { ...snapshot, agentCount: snapshot.agents.length, runningCount, doneCount, errorCount };
+}
+
+export interface EmptyFleetSummary {
+  /** True when the run launched at least one agent but every one of them returned no usable result. */
+  allEmpty: boolean;
+  /** Agents that ran to a terminal state and returned null (recoverable failure exhausted, e.g. AGENT_EMPTY_OUTPUT). */
+  emptyCount: number;
+  /** Agents that produced a real result. */
+  doneCount: number;
+  /** Labels of the empty agents, capped for a readable warning line. */
+  emptyLabels: string[];
+}
+
+/**
+ * Detect the "empty fleet" case: a run that spent on at least one agent yet got
+ * zero usable results back. `agent()` resolves a recoverable failure (e.g.
+ * `AGENT_EMPTY_OUTPUT` after retries are exhausted) to `null` rather than
+ * throwing, so an all-null fleet still reports the run as completed — without
+ * this check the host can mistake "nothing was produced" for "everything
+ * succeeded". Agents still queued/running are not counted; only terminal
+ * `error` (null result) and `done` (real result) states decide.
+ */
+export function emptyFleetSummary(agents: WorkflowAgentSnapshot[], maxLabels = 5): EmptyFleetSummary {
+  const terminal = agents.filter((agent) => agent.status === "error" || agent.status === "done");
+  const empty = terminal.filter((agent) => agent.status === "error");
+  const doneCount = terminal.length - empty.length;
+  return {
+    allEmpty: terminal.length > 0 && doneCount === 0,
+    emptyCount: empty.length,
+    doneCount,
+    emptyLabels: empty.slice(0, maxLabels).map((agent) => agent.label || `agent #${agent.id}`),
+  };
+}
+
+/**
+ * One-line "started in the background" notice pointing at a progress surface
+ * that exists in the current host. The task panel and /workflows navigator are
+ * TUI components (`ui.custom()` / widget factories) that no-op in RPC hosts
+ * such as Paseo even though `ctx.hasUI` is true there — so non-TUI modes are
+ * pointed at `/workflows status <id>`, which prints plain text any host can
+ * display.
+ */
+export function backgroundStartNotice(
+  name: string,
+  runId: string,
+  mode: ExtensionContext["mode"] | undefined,
+  deliverable: "report" | "result",
+): string {
+  const where =
+    mode === "tui" ? "watch the task panel or /workflows" : `check progress with /workflows status ${runId}`;
+  return `/${name} running in the background (${runId}) — ${where}; the ${deliverable} is posted here when it finishes.`;
 }
 
 export function createWidgetWorkflowDisplay(
@@ -259,7 +333,13 @@ export function renderWorkflowLines(
   options: WorkflowDisplayOptions = {},
   theme: ThemeLike = NO_THEME,
 ): string[] {
-  const maxAgents = options.maxAgents ?? 8;
+  // A non-positive cap falls back to the default (mirrors clampMaxAgents in
+  // the task panel): slice(-0) === slice(0) would otherwise render ALL agents
+  // (audit2 #31).
+  // Math.floor: a fractional cap like 0.5 would pass the >0 guard yet
+  // slice(-0.5) → slice(0) renders ALL agents — same bug class as #31.
+  const maxAgents =
+    options.maxAgents !== undefined && options.maxAgents > 0 ? Math.max(1, Math.floor(options.maxAgents)) : 8;
   const showResultPreviews = options.showResultPreviews ?? false;
   const state =
     snapshot.errorCount > 0
@@ -281,8 +361,24 @@ export function renderWorkflowLines(
     : unique(snapshot.agents.map((agent) => agent.phase).filter(Boolean) as string[]);
   const rendered = new Set<WorkflowAgentSnapshot>();
 
+  // Single-pass phase bucketing (audit2 #24): per-phase filter() loops made
+  // every render O(phases × agents), which dominates at large fleets.
+  const agentsByPhase = new Map<string, WorkflowAgentSnapshot[]>();
+  for (const agent of snapshot.agents) {
+    // Degenerate case: an agent whose phase is "" renders under "Unphased"
+    // even when meta.phases declares a ""-titled phase (the phase row then
+    // reads 0/0) — same as the pre-bucketing behavior for untitled agents.
+    if (!agent.phase) continue;
+    let bucket = agentsByPhase.get(agent.phase);
+    if (!bucket) {
+      bucket = [];
+      agentsByPhase.set(agent.phase, bucket);
+    }
+    bucket.push(agent);
+  }
+
   for (const phase of phaseNames) {
-    const agents = snapshot.agents.filter((agent) => agent.phase === phase);
+    const agents = agentsByPhase.get(phase) ?? [];
     for (const agent of agents) rendered.add(agent);
     const done = agents.filter((agent) => agent.status === "done").length;
     const running = agents.filter((agent) => agent.status === "running").length;

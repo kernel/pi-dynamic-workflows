@@ -2,7 +2,7 @@
 # Exhaustive workflow capability facts
 
 Contract format: `1.0.0`<br>
-Contract content / skill / extension: `3.7.0`
+Contract content / skill / extension: `3.13.0`
 
 Every exact fact below is projected from the installed extension's capability contract. Explanatory judgment belongs in the hand-written references next to this file.
 
@@ -17,11 +17,14 @@ Every exact fact below is projected from the installed extension's capability co
 - `phase`: string (optional; default: current phase)
 - `schema`: plain JSON Schema (optional)
 - `model`: string (optional; highest-priority exact model selector)
+- `thinking`: "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" (optional; call-site value overrides agentType thinking; selected model suffix takes precedence; invalid values fail before dispatch)
 - `tier`: string (optional; configured route name; dynamic reference: model-routes)
-- `isolation`: "worktree" (optional)
+- `isolation`: "worktree" | false (optional)
+- `keepWorktree`: boolean (optional; default: true)
+- `cwd`: string (optional; non-empty absolute existing directory; resolved to its real path; coding tools and session cwd use the target directory; settings and AGENTS/skill resources also use it unless explicitly injected by the embedding host; cannot combine with worktree isolation)
 - `thread`: string (optional; non-empty name; same-name calls must be sequential)
 - `agentType`: string (optional; must come from provided context; dynamic reference: agent-types)
-- `timeoutMs`: number | null (optional; default: run timeout; null disables)
+- `timeoutMs`: number | null (optional; default: run timeout, finite ms in [1, 2^31-1]; null disables)
 - `retries`: number (optional; default: run retry count; finite values are floored and clamped to 0..3)
 - Constraint: recoverable failures return null after retries; nonrecoverable failures throw
 - Constraint: schema noncompliance after bounded structured-output repair is nonrecoverable and bypasses agent retries
@@ -30,10 +33,16 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: a named thread retains its full Pi transcript and session identity only within one uninterrupted workflow invocation
 - Constraint: threaded calls are live-execution resume barriers and are never journaled
 - Constraint: same-thread calls must be sequential; threads cannot use worktree isolation
-- Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > implicit medium > session default
+- Constraint: a named thread's canonical cwd is fixed by its first call; a later call using that name with a different cwd fails validation instead of reusing the prior transcript
+- Constraint: an explicit cwd must be a non-empty absolute existing directory; its real path determines coding tools and session cwd; default settings and AGENTS/skill resources follow it while embedding-host dependency overrides remain authoritative; it participates in resume identity and cannot combine with worktree isolation
+- Constraint: selector priority is explicit model > agentType model > tier > phase model > metadata model > inherited main model (inheritMainModel on) > implicit medium > session default
 - Constraint: an explicit model, agentType model, tier, or phase model that resolves to an unavailable model throws MODEL_NOT_FOUND naming the source (e.g. the tier and what it resolved to) instead of falling back
-- Constraint: only the implicit default medium tier (no explicit model, tier, agentType, or phase model requested) degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
-- Constraint: worktree isolation is best-effort; failure logs that isolation was ignored and continues without an isolated working directory
+- Constraint: only the implicit route an untagged agent falls into — the implicit default medium tier, or the inherited main model when inheritMainModel is on (no explicit model, tier, agentType, or phase model requested) — degrades to the session default when unavailable, logging a one-time run-visible warning instead of throwing
+- Constraint: with the inheritMainModel setting on, an untagged agent (no explicit model, tier, agentType model, or phase model) inherits the session's main model (the model in effect when the run starts) instead of the implicit medium tier or the settings default; an unavailable inherited model degrades to the settings default with a one-time run-visible warning instead of throwing
+- Constraint: requested worktree isolation fails closed before agent execution if git cannot create the worktree; it never falls back to the shared checkout
+- Constraint: isolation: false opts out of an agentType worktree default
+- Constraint: keepWorktree defaults true (worktree kept for merge); false deletes after the call
+- Constraint: each live execution creates a uniquely owned worktree; retries or resume never reuse or overwrite a retained worktree
 
 <a id="parallel"></a>
 ## parallel
@@ -73,9 +82,12 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `verify(item: unknown, options?: { reviewers?: number; threshold?: number; lens?: string \| string[] }) => Promise<{ real: boolean; realCount: number; total: number; votes: Array<{ real: boolean; reason?: string }> }>`
 - Option shape: `verify-options`
-- `reviewers`: number (optional; default: 2; authors should provide a finite integer; runtime clamps below 1)
+- `reviewers`: number (optional; default: 2; only undefined uses the default; all supplied values, including null, must be finite integers >= 1 or throw TypeError)
 - `threshold`: number (optional; default: 0.5)
 - `lens`: string | string[] (optional)
+- Constraint: external abort takes precedence over capacity preflight and option validation; no reviewer starts
+- Constraint: consumes one logical agent slot per reviewer (default 2); runtime preflights the whole reviewer fan-out before starting any reviewer
+- Constraint: agent execution retries do not consume extra logical slots
 - Constraint: reviewer failures are omitted; successful votes form the denominator in realCount / total
 - Constraint: threshold comparison is inclusive and real is false when no reviewer succeeds
 - Constraint: multiple lenses cycle across reviewers
@@ -87,8 +99,12 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `judgePanel(attempts: unknown[], options?: { judges?: number; rubric?: string }) => Promise<{ index: number; attempt: unknown; score: number; judgments: Array<{ score: number; reason?: string }> } \| undefined>`
 - Option shape: `judge-panel-options`
-- `judges`: number (optional; default: 3; authors should provide a finite integer; runtime clamps below 1)
+- `judges`: number (optional; default: 3; only undefined uses the default; all supplied values, including null, must be finite integers >= 1 or throw TypeError)
 - `rubric`: string (optional; default: "overall quality and correctness")
+- Constraint: external abort takes precedence over capacity preflight and option validation; no judge starts
+- Constraint: consumes populated attempts × judges logical agent slots (dense input: attempts.length × judges; default judges 3); runtime preflights the full normalized fan-out before starting any judge
+- Constraint: sparse attempt holes are absent candidates and consume no slots; populated candidates retain their original input index
+- Constraint: agent execution retries do not consume extra logical slots
 - Constraint: failed judgments are omitted and each candidate score averages successful judgments only
 - Constraint: a candidate with no successful judgments scores 0
 - Constraint: highest mean score wins with stable input index as the tie-break; empty input returns undefined
@@ -115,6 +131,9 @@ Every exact fact below is projected from the installed extension's capability co
 - Classification: `runtime-global`
 - Support: `supported`
 - Signature: `completenessCheck(taskArgs: unknown, results: unknown) => Promise<{ complete: boolean; missing?: string[] } \| null>`
+- Constraint: external abort takes precedence over capacity preflight; no critic starts
+- Constraint: consumes one logical agent slot; runtime preflights capacity before starting the critic
+- Constraint: agent execution retries do not consume extra logical slots
 - Constraint: only the first 4,000 characters of serialized result evidence are sent to the critic
 - Constraint: missing is optional and recoverable critic failure returns null
 - Constraint: large evidence sets must be chunked or summarized before relying on the advisory verdict
@@ -153,7 +172,7 @@ Every exact fact below is projected from the installed extension's capability co
 
 - Classification: `runtime-global`
 - Support: `supported`
-- Signature: `checkpoint(prompt, options?) => Promise<unknown>`
+- Signature: `checkpoint(prompt, options?) \| checkpoint({ kind, checkpointId, payload }) => Promise<unknown>`
 - Option shape: `checkpoint-options`
 - `default`: unknown (optional; default: true when no UI and omitted)
 - `headless`: "default" | "abort" (optional; default: "default")
@@ -163,6 +182,10 @@ Every exact fact below is projected from the installed extension's capability co
 - Constraint: foreground confirm and headless behavior are implemented; input/select/timeout are declared-only
 - Constraint: consumes one agent slot and no tokens
 - Constraint: journaled answers replay only within an unchanged resume prefix
+- Constraint: object checkpoints accept an open kind identifier, persist their JSON payload, and pause the run
+- Constraint: a controller attaches a lossless-JSON response to the run and checkpoint before workflow_control resumes with only the exact run ID and checkpoint ID
+- Constraint: status exposes only checkpoint ID, kind, and status; the durable response never enters model-visible output
+- Constraint: durable checkpoint responses resume the same run ID, are journaled before continuation, and reject stale or conflicting delivery
 
 <a id="log"></a>
 ## log
@@ -259,6 +282,8 @@ Every exact fact below is projected from the installed extension's capability co
 - Support: `supported`
 - Signature: `maxAgents?: number = 1000`
 - Constraint: default, not a hard product maximum
+- Constraint: counts logical agent calls across the shared nested run tree, including quality-helper expansion: verify = reviewers, judgePanel = populated attempts × judges (dense input: attempts.length × judges), completenessCheck = 1
+- Constraint: agent execution retries do not consume extra logical slots; retry(), gate(), and loopUntilDry callbacks must be budgeted from their bounded planned calls
 
 <a id="tool-input-concurrency"></a>
 ## concurrency
