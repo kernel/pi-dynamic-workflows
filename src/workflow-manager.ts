@@ -917,7 +917,9 @@ export class WorkflowManager extends EventEmitter {
     // execution's progress callback would otherwise keep driving live UI
     // (task panel, etc.) for a run that's been superseded or deleted.
     const progress = () => {
-      if (this.isCurrent(managed)) onProgress?.(managed.snapshot);
+      if (!this.isCurrent(managed)) return;
+      this.schedulePersist(managed);
+      onProgress?.(managed.snapshot);
     };
     // Live per-call display updates are keyed by the same unique `id` upstream
     // events carry (see managed.agentsById) — the manager keeps no separate map.
@@ -1503,18 +1505,17 @@ export class WorkflowManager extends EventEmitter {
     managed.lease = undefined;
   }
 
-  /** Trailing-edge throttle window for high-frequency progress persists (see schedulePersist). */
-  private static readonly PERSIST_THROTTLE_MS = 400;
+  /** Keep disk state current before the 250 ms headless invalidation flush reads it. */
+  private static readonly PERSIST_THROTTLE_MS = 200;
 
   /** Pending trailing-edge persist timers for high-frequency progress events, keyed by runId. */
   private persistTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   /**
-   * Coalesce rapid progress persists (currently: onAgentJournal, which fires
-   * once per completed agent and can burst under concurrency) to at most one
-   * disk write per PERSIST_THROTTLE_MS (trailing edge) instead of one write
-   * per tick. Delta persistence still compares the current state and performs
-   * synchronous log/head writes, so concurrent completions should share work.
+   * Coalesce rapid progress persists to at most one disk write per
+   * PERSIST_THROTTLE_MS (trailing edge) instead of one write per event.
+   * Delta persistence still compares the current state and performs synchronous
+   * log/head writes, so concurrent updates should share work.
    *
    * Lifecycle-critical writes (status transitions, run end, pause/resume/stop)
    * must NOT use this — call persistRun() directly, which flushes (and cancels)

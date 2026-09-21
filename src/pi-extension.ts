@@ -13,6 +13,8 @@ import {
   WORKFLOW_EXTENSION_VERSION,
   type WorkflowReloadRuntime,
 } from "./extension-reload.js";
+import { HeadlessNavigatorModel, installHeadlessWorkflowInvalidations } from "./headless.js";
+import { installHeadlessWorkflowControls } from "./headless-control.js";
 import { registerAllSavedWorkflows } from "./saved-commands.js";
 import {
   bindSessionDelivery,
@@ -21,7 +23,6 @@ import {
   installTaskPanel,
   suspendResultDelivery,
 } from "./task-panel.js";
-import { UsageLimitScheduler } from "./usage-limit-scheduler.js";
 import { createWebTools } from "./web-tools.js";
 import { registerWorkflowCommands } from "./workflow-commands.js";
 import { createWorkflowControlTool } from "./workflow-control-tool.js";
@@ -177,10 +178,21 @@ export default function extension(pi: ExtensionAPI) {
   pi.registerTool(workflowTool);
   pi.registerTool(workflowControlTool);
 
-  let usageLimitScheduler = new UsageLimitScheduler(manager);
+  const headlessNavigator = new HeadlessNavigatorModel({
+    listRuns: () => getManager().listRuns(),
+    getRun: (runId) => getManager().getRun(runId),
+    pause: (runId) => getManager().pause(runId),
+    resume: (runId) => getManager().resume(runId),
+    stop: (runId) => getManager().stop(runId),
+    startInBackground: (script, args) => getManager().startInBackground(script, args),
+  });
+  installHeadlessWorkflowControls(pi, headlessNavigator, { cwd: getCwd });
+  let headlessInvalidations = installHeadlessWorkflowInvalidations(pi, manager, {
+    availableActions: (runId) => headlessNavigator.availableActions(runId),
+  });
 
   pi.on("session_shutdown", (event?: { reason?: string; targetSessionFile?: string }) => {
-    usageLimitScheduler.dispose();
+    headlessInvalidations.dispose();
     // Always stop live sends first so a completion racing teardown cannot
     // deliver into the outgoing session (or throw on a just-stale ctx and be
     // lost). Replacement reasons stage the runtime for the next generation
@@ -276,8 +288,10 @@ export default function extension(pi: ExtensionAPI) {
       managerOptions = buildManagerOptions(cwd, storage);
       manager = new WorkflowManager({ cwd, ...managerOptions });
       installResultDelivery(pi, manager, { loadSettings: () => loadWorkflowSettings({ cwd: getCwd() }) });
-      usageLimitScheduler.dispose();
-      usageLimitScheduler = new UsageLimitScheduler(manager);
+      headlessInvalidations.dispose();
+      headlessInvalidations = installHeadlessWorkflowInvalidations(pi, manager, {
+        availableActions: (runId) => headlessNavigator.availableActions(runId),
+      });
     } else if (cwd !== sessionCwd) {
       // Manager already owns the session project; just align the local cwd/storage.
       cwd = sessionCwd;
