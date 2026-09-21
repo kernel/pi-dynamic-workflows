@@ -462,6 +462,7 @@ export function createRunRecordStore(fs: PersistenceFsLayer) {
       save(path, {
         ...legacy,
         status: "paused",
+        pauseReason: "cold_recovery",
         updatedAt: endedAt,
         agents: settleInterruptedPersistedAgents(legacy.agents ?? [], INTERRUPTED_AGENT_CAUSE, endedAt),
       });
@@ -470,10 +471,15 @@ export function createRunRecordStore(fs: PersistenceFsLayer) {
     commit(
       path,
       head,
-      { set: { status: "paused", updatedAt: endedAt }, remove: [], arrays: {}, settleAgentsAt: endedAt },
       {
-        keys: [...new Set([...head.keys, "status", "updatedAt", "agents"])],
-        index: { ...head.index, status: "paused", updatedAt: endedAt },
+        set: { status: "paused", pauseReason: "cold_recovery", updatedAt: endedAt },
+        remove: [],
+        arrays: {},
+        settleAgentsAt: endedAt,
+      },
+      {
+        keys: [...new Set([...head.keys, "status", "pauseReason", "updatedAt", "agents"])],
+        index: { ...head.index, status: "paused", pauseReason: "cold_recovery", updatedAt: endedAt },
         summary: {
           ...summary,
           active: 0,

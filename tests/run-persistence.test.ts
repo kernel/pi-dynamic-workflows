@@ -1134,6 +1134,7 @@ test(
     new WorkflowManager({ cwd });
     const recovered = rp.load("stale");
     assert.equal(recovered?.status, "paused", "stale running -> paused (journal preserved for resume)");
+    assert.equal(recovered?.pauseReason, "cold_recovery");
     assert.equal(recovered?.agents[0]?.status, "skipped", "orphaned in-flight agents cannot still be running");
     assert.equal(recovered?.agents[0]?.error, "interrupted");
   }),
@@ -1157,6 +1158,7 @@ test(
     new WorkflowManager({ cwd });
     const recovered = rp.load("paused-ghost");
     assert.equal(recovered?.status, "paused");
+    assert.equal(recovered?.pauseReason, "cold_recovery");
     assert.equal(recovered?.agents[0]?.status, "skipped");
     assert.equal(recovered?.agents[0]?.error, "interrupted");
     assert.ok(recovered?.agents[0]?.endedAt);
